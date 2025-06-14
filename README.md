@@ -1,12 +1,12 @@
 # Ocean Generator
 
-A command-line tool for generating tessellated 2D plane-like meshes with customizable parameters and trochoidal wave simulation.
+A command-line tool for generating tessellated 2D plane-like meshes with customizable parameters and Tessendorf FFT-based wave simulation.
 
 ## Features
 
 - Generate 2D plane meshes with customizable dimensions and resolution
 - Apply random noise/perturbation to create uneven surfaces
-- Simulate realistic ocean waves using trochoidal (Gerstner) wave equations
+- Simulate realistic ocean waves using Tessendorf's FFT-based algorithm
 - Control wave parameters like amplitude, wavelength, steepness, and direction
 - Export to multiple formats (OBJ, STL, GLB, RAW)
 - Output to file or stdout
@@ -17,7 +17,7 @@ Below is an animation generated using the Python script `generate_ocean_animatio
 
 ![Ocean Animation](ocean_animation.gif)
 
-The animation demonstrates how the ocean surface evolves over time using the trochoidal wave simulation with parameters:
+The animation demonstrates how the ocean surface evolves over time using the Tessendorf wave simulation with parameters:
 - Wind speed: 5.0 m/s
 - Wave amplitude: 1.5
 - Choppiness: 0.5
@@ -91,7 +91,7 @@ ocean-generator --width 20 --height 30 --width-segments 20 --height-segments 15
 # Add some noise/perturbation to create an uneven surface
 ocean-generator --noise 0.3
 
-# Add trochoidal wave simulation with default parameters
+# Add Tessendorf wave simulation with default parameters
 ocean-generator --waves
 
 # Customize wave parameters
@@ -141,7 +141,7 @@ ocean-generator --waves --time 0.0 -f glb -o ocean_frame_0.glb
 ### Wave Simulation Parameters
 
 ```
---waves                            Enable trochoidal wave simulation
+--waves                            Enable Tessendorf wave simulation
 --wave-count <COUNT>               Number of wave components to simulate [default: 3]
 --amplitude <AMPLITUDE>            Wave amplitude (height of waves) [default: 0.5]
 --wavelength <WAVELENGTH>          Wave length (distance between wave crests) [default: 2.0]
@@ -189,19 +189,20 @@ ocean-generator --waves --time 0.0 -f glb -o ocean_frame_0.glb
    # And so on...
    ```
 
-## About Trochoidal Wave Simulation
+## About Tessendorf Wave Simulation
 
-The ocean generator uses Gerstner waves (also known as trochoidal waves) to simulate realistic ocean surfaces. These waves are characterized by:
+The ocean generator uses Tessendorf's FFT-based algorithm to simulate realistic ocean surfaces. This statistical wave model is characterized by:
 
-- Sharp crests and flat troughs, similar to real ocean waves
-- Circular particle motion, which creates more realistic wave shapes than simple sine waves
-- Horizontal and vertical displacement, which creates the characteristic wave shape
+- Statistical model based on empirical observations of real ocean waves
+- Fast Fourier Transform (FFT) for efficient computation of complex wave patterns
+- Physically-based simulation that accounts for wind direction and speed
+- Realistic wave dispersion and interference patterns
 
-The implementation uses multiple wave components with varying parameters to create complex, natural-looking ocean surfaces. Each wave component has:
+The Tessendorf algorithm, developed by Jerry Tessendorf, creates realistic ocean surfaces by:
 
-- Different amplitude (height)
-- Different wavelength (distance between crests)
-- Different direction (for cross-patterns)
-- Different phase (for natural variation)
+- Generating a height field using a Phillips spectrum that depends on wind direction and speed
+- Computing the wave field in frequency domain and transforming it using FFT
+- Implementing horizontal displacement for realistic wave shape and movement
+- Adding time-dependent animation that obeys the wave dispersion relation
 
-The combined effect of these components creates a more realistic ocean surface than a single wave would.
+This algorithm is widely used in computer graphics and film (featured in movies like "Titanic" and "Waterworld") because it produces statistically realistic ocean surfaces with computational efficiency.
