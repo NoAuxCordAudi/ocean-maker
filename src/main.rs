@@ -93,13 +93,29 @@ fn main() -> Result<()> {
 
     // Create a mesh from the displacement field
     println!("Creating mesh...");
-    let (positions, indices, normals, uvs) = create_mesh(
+    let (positions, indices, normals, uvs, min_height, max_height) = create_mesh(
         args.width,
         args.length,
         args.width_segments,
         args.length_segments,
         &displacement,
     );
+    
+    // Log min/max z-axis displacement and compare with commanded amplitude
+    println!("Z-axis displacement range: {:.6} to {:.6} units", min_height, max_height);
+    let displacement_range = max_height - min_height;
+    let expected_range = args.amplitude * 2.0; // Peak-to-peak should be ~2x amplitude
+    println!("Total displacement range: {:.6} units", displacement_range);
+    println!("Expected range (2 * amplitude): {:.6} units", expected_range);
+    
+    // Check if the actual range is close to the expected range
+    let range_ratio = displacement_range / expected_range;
+    println!("Ratio of actual/expected range: {:.4}", range_ratio);
+    if range_ratio >= 0.75 && range_ratio <= 1.25 {
+        println!("✓ Displacement range is reasonably close to commanded amplitude");
+    } else {
+        println!("! Displacement range differs significantly from commanded amplitude");
+    }
 
     // Export the mesh
     println!("Exporting to {}...", args.output.display());
@@ -118,7 +134,7 @@ fn create_mesh(
     width_segments: usize,
     length_segments: usize,
     displacement: &tessendorf::DisplacementField,
-) -> (Vec<Point3<f32>>, Vec<u32>, Vec<Vector3<f32>>, Vec<Vector2<f32>>) {
+) -> (Vec<Point3<f32>>, Vec<u32>, Vec<Vector3<f32>>, Vec<Vector2<f32>>, f32, f32) {
     let grid_x = width_segments;
     let grid_z = length_segments;
     let resolution = displacement.resolution;
@@ -296,8 +312,8 @@ fn create_mesh(
                  bottom_edge[bottom_edge.len()/2], top_edge[top_edge.len()/2]);
     }
 
-    // Return the mesh data
-    (positions, indices, normals, uvs)
+    // Return the mesh data along with min/max height values
+    (positions, indices, normals, uvs, min_height, max_height)
 }
 
 /// Export the mesh to a GLB file with an NxN tile pattern in the xy-plane
