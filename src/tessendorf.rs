@@ -183,12 +183,38 @@ pub fn compute_wave_field(params: &OceanParams, time: f32) -> DisplacementField 
     let disp_x = ifft2d(&mut planner, disp_x_field);
     let disp_y = ifft2d(&mut planner, disp_y_field);
     
-    // Scale height by additional amplitude factor to make waves more visible
-    // This is a post-processing step to ensure the wave heights match the expected amplitude
-    let height_scale_factor = params.amplitude * 150.0; // Dramatically increased to make waves clearly visible
+    // First pass: calculate the current min/max to determine actual range
+    let mut min_height = f32::MAX;
+    let mut max_height = f32::MIN;
+    
     for i in 0..n {
         for j in 0..n {
-            height[i][j] *= height_scale_factor;
+            min_height = min_height.min(height[i][j]);
+            max_height = max_height.max(height[i][j]);
+        }
+    }
+    
+    // Calculate current range and target range
+    let current_range = max_height - min_height;
+    let target_range = params.amplitude * 2.0; // We want peak-to-peak to be 2*amplitude
+    
+    // Calculate scaling factor to achieve the target range
+    // Avoid division by zero
+    let height_scale_factor = if current_range > 1e-6 {
+        target_range / current_range
+    } else {
+        // If there's no variation, use a reasonable default
+        params.amplitude
+    };
+    
+    println!("Wave height scaling: Raw range = {:.6}, Target = {:.6}, Scale factor = {:.6}", 
+             current_range, target_range, height_scale_factor);
+    
+    // Apply scaling to match the commanded amplitude
+    for i in 0..n {
+        for j in 0..n {
+            // Center around zero and scale to match the target amplitude
+            height[i][j] = (height[i][j] - (min_height + max_height) / 2.0) * height_scale_factor;
         }
     }
     
