@@ -31,13 +31,18 @@ struct Args {
     #[arg(long, default_value_t = 5.0)]
     wind_speed: f32,
 
-    /// Wind direction X component
+    /// Wind direction X component (ignored if --wind-angle is set)
     #[arg(long, default_value_t = 1.0, allow_negative_numbers = true)]
     wind_dir_x: f32,
 
-    /// Wind direction Y component
+    /// Wind direction Y component (ignored if --wind-angle is set)
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     wind_dir_y: f32,
+
+    /// Wind direction as angle in degrees (0 = +X, 90 = +Y).
+    /// When provided, overrides --wind-dir-x / --wind-dir-y.
+    #[arg(long, allow_negative_numbers = true)]
+    wind_angle: Option<f32>,
 
     /// Wave amplitude
     #[arg(short, long, default_value_t = 1.0)]
@@ -74,12 +79,22 @@ fn main() -> Result<()> {
     println!("Wave parameters: wind speed={}, amplitude={}, choppiness={}, time={}", 
              args.wind_speed, args.amplitude, args.choppiness, args.time);
 
+    // Resolve wind direction: --wind-angle wins if provided, else x/y components.
+    let wind_direction = match args.wind_angle {
+        Some(deg) => {
+            let rad = deg.to_radians();
+            glam::Vec2::new(rad.cos(), rad.sin())
+        }
+        None => glam::Vec2::new(args.wind_dir_x, args.wind_dir_y).normalize(),
+    };
+    println!("Wind direction: ({:.3}, {:.3})", wind_direction.x, wind_direction.y);
+
     // Create ocean parameters
     let params = tessendorf::OceanParams {
         resolution: args.width_segments.max(args.length_segments),
         size: args.width.max(args.length),
         wind_speed: args.wind_speed,
-        wind_direction: glam::Vec2::new(args.wind_dir_x, args.wind_dir_y).normalize(),
+        wind_direction,
         amplitude: args.amplitude,
         choppiness: args.choppiness,
         gravity: 9.81,

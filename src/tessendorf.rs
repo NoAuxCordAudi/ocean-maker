@@ -47,6 +47,18 @@ pub struct DisplacementField {
     pub normal_z: Vec<Vec<f32>>,         // Surface normal Z component
 }
 
+/// Map an FFT bin index in [0, n) to its signed wave-number index.
+/// Standard FFT layout: bins [0, n/2) are positive frequencies,
+/// bins [n/2, n) are negative frequencies. This lets us feed the
+/// spectrum directly into an IFFT without an explicit fftshift.
+fn fft_freq(i: usize, n: usize) -> f32 {
+    if i < n / 2 {
+        i as f32
+    } else {
+        i as f32 - n as f32
+    }
+}
+
 /// Phillips spectrum implementation for wave height distribution
 /// This determines the statistical distribution of wave heights
 fn phillips_spectrum(k: Vec2, params: &OceanParams) -> f32 {
@@ -81,11 +93,11 @@ fn generate_h0(params: &OceanParams) -> Vec<Vec<Complex32>> {
     
     for i in 0..n {
         for j in 0..n {
-            // Calculate wave vector k
-            let k_x = 2.0 * PI * ((i as f32) - (n as f32) / 20.0) / params.size;
-            let k_y = 2.0 * PI * ((j as f32) - (n as f32) / 20.0) / params.size;
+            // Calculate wave vector k using FFT frequency ordering
+            let k_x = 2.0 * PI * fft_freq(i, n) / params.size;
+            let k_y = 2.0 * PI * fft_freq(j, n) / params.size;
             let k = Vec2::new(k_x, k_y);
-            
+
             // Calculate Phillips spectrum
             let phillips = phillips_spectrum(k, params);
             
@@ -134,9 +146,9 @@ pub fn compute_wave_field(params: &OceanParams, time: f32) -> DisplacementField 
     // Compute height field and derivatives for the given time
     for i in 0..n {
         for j in 0..n {
-            // Calculate wave vector k
-            let k_x = 2.0 * PI * ((i as f32) - (n as f32) / 20.0) / params.size;
-            let k_y = 2.0 * PI * ((j as f32) - (n as f32) / 20.0) / params.size;
+            // Calculate wave vector k using FFT frequency ordering
+            let k_x = 2.0 * PI * fft_freq(i, n) / params.size;
+            let k_y = 2.0 * PI * fft_freq(j, n) / params.size;
             let k = Vec2::new(k_x, k_y);
             let k_length = k.length();
             
@@ -225,14 +237,11 @@ pub fn compute_wave_field(params: &OceanParams, time: f32) -> DisplacementField 
     
     for i in 0..n {
         for j in 0..n {
-            // Flip sign based on i+j parity (due to FFT frequency shifting)
-            let sign = if (i + j) % 2 == 0 { 1.0 } else { -1.0 };
-            
             // Create normal from slope (normalized)
-            let nx = sign * -slope_x[i][j];
-            let ny = sign * -slope_y[i][j];
+            let nx = -slope_x[i][j];
+            let ny = -slope_y[i][j];
             let nz = 1.0;
-            
+
             // Normalize
             let length = (nx * nx + ny * ny + nz * nz).sqrt();
             normal_x[i][j] = nx / length;
@@ -253,33 +262,35 @@ pub fn compute_wave_field(params: &OceanParams, time: f32) -> DisplacementField 
     }
 }
 
-/// Perform 2D inverse FFT on complex field
-fn ifft2d(planner: &mut FftPlanner<f32>, field: Vec<Vec<Complex32>>) -> Vec<Vec<f32>> {
+/// Perform 2D inverse FFT on complex field via row-then-column 1D IFFTs.
+/// rustfft is un-normalized, so we divide by n*n at the end (one factor
+/// of n per dimension).
+fn ifft2d(planner: &mut FftPlanner<f32>, mut field: Vec<Vec<Complex32>>) -> Vec<Vec<f32>> {
     let n = field.len();
-    let mut result = vec![vec![0.0; n]; n];
-    
-    // Create flattened complex array for FFT
-    let mut flat_data: Vec<Complex32> = Vec::with_capacity(n * n);
+    let fft = planner.plan_fft_inverse(n);
+
+    // IFFT along rows (j axis)
+    for row in field.iter_mut() {
+        fft.process(row);
+    }
+
+    // IFFT along columns (i axis): transpose, process, transpose back
+    let mut transposed = vec![vec![Complex32::new(0.0, 0.0); n]; n];
     for i in 0..n {
         for j in 0..n {
-            flat_data.push(field[i][j]);
+            transposed[j][i] = field[i][j];
         }
     }
-    
-    // Create IFFT
-    let fft = planner.plan_fft_inverse(n * n);
-    
-    // Execute IFFT
-    fft.process(&mut flat_data);
-    
-    // Unflatten result and scale
+    for col in transposed.iter_mut() {
+        fft.process(col);
+    }
+
     let scale = 1.0 / (n * n) as f32;
+    let mut result = vec![vec![0.0; n]; n];
     for i in 0..n {
         for j in 0..n {
-            let idx = i * n + j;
-            result[i][j] = flat_data[idx].re * scale;
+            result[i][j] = transposed[j][i].re * scale;
         }
     }
-    
     result
 }
