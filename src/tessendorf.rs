@@ -47,6 +47,55 @@ pub struct DisplacementField {
     pub normal_z: Vec<Vec<f32>>,         // Surface normal Z component
 }
 
+/// One interpolated sample of a [`DisplacementField`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldSample {
+    pub height: f32,
+    pub displacement: Vec2,
+    pub normal: [f32; 3],
+}
+
+impl DisplacementField {
+    /// Sample the field at continuous grid coordinates `(u, v)`, measured in
+    /// grid cells. The field is periodic with period `resolution`, so
+    /// coordinates wrap: `u == resolution` returns exactly the same sample as
+    /// `u == 0`. This is what makes tiled meshes seamless.
+    pub fn sample_periodic(&self, u: f64, v: f64) -> FieldSample {
+        let n = self.resolution;
+        let (i0, i1, fx) = wrap_index(u, n);
+        let (j0, j1, fy) = wrap_index(v, n);
+
+        let lerp = |f: &Vec<Vec<f32>>| -> f32 {
+            let a = f[i0][j0] + (f[i1][j0] - f[i0][j0]) * fx;
+            let b = f[i0][j1] + (f[i1][j1] - f[i0][j1]) * fx;
+            a + (b - a) * fy
+        };
+
+        let mut normal = [lerp(&self.normal_x), lerp(&self.normal_y), lerp(&self.normal_z)];
+        let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if len > 1e-6 {
+            normal.iter_mut().for_each(|c| *c /= len);
+        } else {
+            normal = [0.0, 0.0, 1.0];
+        }
+
+        FieldSample {
+            height: lerp(&self.height),
+            displacement: Vec2::new(lerp(&self.displacement_x), lerp(&self.displacement_y)),
+            normal,
+        }
+    }
+}
+
+/// Wrap a continuous grid coordinate into (lower index, upper index, fraction).
+fn wrap_index(u: f64, n: usize) -> (usize, usize, f32) {
+    let wrapped = u.rem_euclid(n as f64);
+    let base = wrapped.floor();
+    let frac = (wrapped - base) as f32;
+    let i0 = (base as usize) % n;
+    (i0, (i0 + 1) % n, frac)
+}
+
 /// Map an FFT bin index in [0, n) to its signed wave-number index.
 /// Standard FFT layout: bins [0, n/2) are positive frequencies,
 /// bins [n/2, n) are negative frequencies. This lets us feed the
@@ -293,4 +342,41 @@ fn ifft2d(planner: &mut FftPlanner<f32>, mut field: Vec<Vec<Complex32>>) -> Vec<
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field() -> DisplacementField {
+        let params = OceanParams { resolution: 32, size: 20.0, ..OceanParams::default() };
+        compute_wave_field(&params, 1.3)
+    }
+
+    #[test]
+    fn sample_wraps_exactly_at_period() {
+        let f = field();
+        let n = f.resolution as f64;
+        for k in [0.0, 3.0, 7.5, 31.9] {
+            assert_eq!(f.sample_periodic(0.0, k), f.sample_periodic(n, k));
+            assert_eq!(f.sample_periodic(k, 0.0), f.sample_periodic(k, n));
+            assert_eq!(f.sample_periodic(k, k), f.sample_periodic(k + n, k - n));
+        }
+    }
+
+    #[test]
+    fn sample_on_grid_point_matches_field() {
+        let f = field();
+        let s = f.sample_periodic(5.0, 9.0);
+        assert_eq!(s.height, f.height[5][9]);
+        assert_eq!(s.displacement, Vec2::new(f.displacement_x[5][9], f.displacement_y[5][9]));
+    }
+
+    #[test]
+    fn interpolation_stays_within_neighbours() {
+        let f = field();
+        let s = f.sample_periodic(5.5, 9.0);
+        let (a, b) = (f.height[5][9], f.height[6][9]);
+        assert!(s.height >= a.min(b) - 1e-6 && s.height <= a.max(b) + 1e-6);
+    }
 }

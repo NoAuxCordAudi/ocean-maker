@@ -22,7 +22,7 @@ anyhow = "1.0"
 rayon = "1.7"
 rustfft = "6.1.0"
 num-complex = "0.4.4"
-mesh-tools = "0.4.0"
+mesh-tools = "0.22.0"
 nalgebra = "0.32.3"
 
 [profile.release]
