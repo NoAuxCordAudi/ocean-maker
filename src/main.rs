@@ -106,9 +106,17 @@ struct Args {
     #[arg(long, default_value_t = 0.15, requires = "foam")]
     foam_softness: f32,
 
-    /// Foam e-folding decay time in seconds
-    #[arg(long, default_value_t = 2.0, requires = "foam")]
+    /// Young (bright, crest-locked) foam e-folding decay time in seconds
+    #[arg(long, default_value_t = 0.4, requires = "foam")]
     foam_tau: f32,
+
+    /// Old (dim trail) foam e-folding decay time in seconds
+    #[arg(long, default_value_t = 1.5, requires = "foam")]
+    foam_old_tau: f32,
+
+    /// Brightness of the old-foam trail relative to fresh foam (0 disables the trail)
+    #[arg(long, default_value_t = 0.15, requires = "foam")]
+    foam_old_weight: f32,
 
     /// Foam spin-up before the first frame, in seconds (default: 4.6 x tau)
     #[arg(long, requires = "foam")]
@@ -178,6 +186,8 @@ fn foam_params(args: &Args, sim_resolution: usize, size: f32) -> Result<FoamPara
         substeps: args.foam_substeps,
         softness: args.foam_softness,
         tau: args.foam_tau,
+        old_tau: args.foam_old_tau,
+        old_weight: args.foam_old_weight,
         spinup: args.foam_spinup,
         resolution: args.foam_resolution.unwrap_or(defaults.resolution.max(sim_resolution)),
     })
@@ -269,7 +279,10 @@ fn main() -> Result<()> {
     let foam_seq = match &foam {
         Some(fp) => {
             let dt = 1.0 / args.anim_fps;
-            println!("Simulating foam ({} texel resolution, tau {}s)...", fp.resolution, fp.tau);
+            println!(
+                "Simulating foam ({} texel resolution, tau {}s, trail {}s x{})...",
+                fp.resolution, fp.tau, fp.old_tau, fp.old_weight
+            );
             let seq = simulate_foam(&sim, scale, &times, dt, fp)?;
             println!(
                 "Foam: threshold {:.3}, {:.2}% of texel-frames trigger, mean foam {:.3}, \

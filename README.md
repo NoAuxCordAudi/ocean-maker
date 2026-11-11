@@ -67,9 +67,9 @@ blender --python ocean_foam/ocean_blender.py
   GLB's UVs), `foam.json`: manifest with SHA-256 of every image, `ocean_blender.py`: imports
   the GLB, builds a water+foam material driven by the image sequence and sets fps/frame range.
 - Foam is the smallest eigenvalue of the Jacobian of the choppy displacement, soft-thresholded,
-  decayed exponentially (`--foam-tau`, default 2 s) and spun up before frame 0. `--foam-coverage`
+  in two decaying layers and spun up before frame 0: bright young foam (`--foam-tau`, default 0.4 s) that stays locked to the crests, plus a dim trail (`--foam-old-tau` 1.5 s at `--foam-old-weight` 0.15; 0 disables it). A single long decay makes foam look unrelated to the waves, because foam stays put while crests travel on. `--foam-coverage`
   (default 0.02) is the per-frame fraction of the surface that triggers; the threshold is
-  calibrated to it. Foam stays at fixed points, so it trails behind crests.
+  calibrated to it. Foam stays at fixed material points, so what outlives the crest is left behind as the trail.
 - `--foam-embed` makes a **one-file GLB** instead: all foam frames are baked into a single
   base-colour atlas texture (foam blended into the water colour, wrapped gutters so filtering
   never bleeds between frames), selected per frame by `KHR_texture_transform` and stepped by a

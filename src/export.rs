@@ -373,6 +373,8 @@ pub fn write_foam_sequence(dir: &Path, e: &FoamExport<'_>) -> Result<()> {
             "spinup_frames": seq.spinup_frames,
             "spinup_residual": seq.residual,
             "tau": e.params.tau,
+            "old_tau": e.params.old_tau,
+            "old_weight": e.params.old_weight,
             "softness": e.params.softness,
         },
         "foam_files": files,

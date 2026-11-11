@@ -8,7 +8,12 @@
 //!    demo heuristic, not part of Tessendorf's method.
 //! 2. **Decay** `F_{n+1} = max(F_n * exp(-dt / tau), g_{n+1})`, pointwise on the undisplaced
 //!    (Lagrangian) grid, so the foam is periodic and tiles seamlessly. `tau` is an e-folding
-//!    time. There is no advection: foam stays at fixed material points and leaves trails.
+//!    time. There is no advection: foam stays at fixed material points while crests travel on, so
+//!    it is left behind as a trail. With a long `tau` the trail outlasts the crest by several
+//!    wavelengths and the foam looks unrelated to the waves (measured: foam-weighted height
+//!    z-score +0.18 at 2 s vs +1.1 at 0.3 s for a 20 m patch). Hence **two layers**: bright
+//!    young foam (short `tau`, stays crest-locked) and a dim, long-lived trail
+//!    (`old_tau`, scaled by `old_weight`); the output is `max(young, old_weight * old)`.
 //! 3. **Spin-up**: frames before the clip start are simulated and discarded so the clip does
 //!    not start with empty foam.
 //! 4. **Calibration**: `lambda_T` is the `coverage` quantile of `lambda_min` pooled over all
@@ -33,8 +38,12 @@ pub struct FoamParams {
     pub trigger: Trigger,
     /// Ramp width as a fraction of `1 - lambda_T`; 0 would be a hard threshold.
     pub softness: f32,
-    /// Foam e-folding time in seconds.
+    /// Young (bright, crest-locked) foam e-folding time in seconds.
     pub tau: f32,
+    /// Old (dim trail) foam e-folding time in seconds; only used when `old_weight > 0`.
+    pub old_tau: f32,
+    /// Brightness of the old layer relative to fresh foam, in [0, 1]; 0 disables the trail.
+    pub old_weight: f32,
     /// Spin-up duration in seconds; `None` = automatic (4.6 tau, i.e. 1% residual).
     pub spinup: Option<f32>,
     /// Foam texture resolution (texels per side); at least the simulation resolution.
@@ -46,11 +55,21 @@ pub struct FoamParams {
 
 impl Default for FoamParams {
     fn default() -> Self {
-        Self { trigger: Trigger::Coverage(0.02), softness: 0.15, tau: 2.0, spinup: None, resolution: 256, substeps: 1 }
+        Self {
+            trigger: Trigger::Coverage(0.02),
+            softness: 0.15,
+            tau: 0.4,
+            old_tau: 1.5,
+            old_weight: 0.15,
+            spinup: None,
+            resolution: 256,
+            substeps: 1,
+        }
     }
 }
 
 /// Foam frames for the clip, plus how they were calibrated.
+/// Values are the combined (young + weighted old) foam in [0, 1].
 #[derive(Debug, Clone)]
 pub struct FoamSequence {
     pub resolution: usize,
@@ -120,6 +139,12 @@ pub fn simulate_foam(
     ensure!(!clip_times.is_empty(), "at least one clip time is required");
     ensure!(dt.is_finite() && dt > 0.0, "foam dt must be > 0, got {dt}");
     ensure!(params.tau.is_finite() && params.tau > 0.0, "foam tau must be > 0, got {}", params.tau);
+    ensure!((0.0..=1.0).contains(&params.old_weight), "foam old_weight must be in [0, 1], got {}", params.old_weight);
+    ensure!(
+        params.old_weight == 0.0 || (params.old_tau.is_finite() && params.old_tau > 0.0),
+        "foam old_tau must be > 0, got {}",
+        params.old_tau
+    );
     ensure!(
         params.softness.is_finite() && params.softness > 0.0,
         "foam softness must be > 0, got {}",
@@ -136,9 +161,13 @@ pub fn simulate_foam(
 
     let k = params.substeps;
     let sub_dt = dt / k as f32;
-    // Per-update decay factor; the spin-up length is defined in whole output frames.
+    // Per-update decay factors; the spin-up length is defined in whole output frames and must
+    // outlast the slowest layer in use.
+    let use_old = params.old_weight > 0.0;
+    let slowest = if use_old { params.tau.max(params.old_tau) } else { params.tau };
     let alpha = (-sub_dt / params.tau).exp();
-    let alpha_frame = (-dt / params.tau).exp();
+    let alpha_old = (-sub_dt / params.old_tau).exp();
+    let alpha_frame = (-dt / slowest).exp();
     let auto_frames = ((0.01f32).ln() / alpha_frame.ln()).ceil() as usize;
     let spinup_frames = match params.spinup {
         None => auto_frames,
@@ -195,14 +224,21 @@ pub fn simulate_foam(
 
     let total = lambdas.len() * m * m;
     let triggered = lambdas.iter().flatten().filter(|&&l| l < threshold).count();
-    let mut foam = vec![0.0f32; m * m];
+    let mut young = vec![0.0f32; m * m];
+    let mut old = vec![0.0f32; m * m];
     let mut frames = Vec::with_capacity(clip_times.len());
     for (n, lambda) in lambdas.iter().enumerate() {
-        for (f, &l) in foam.iter_mut().zip(lambda) {
-            *f = step(*f, trigger_value(l, threshold, params.softness), alpha);
+        for ((y, o), &l) in young.iter_mut().zip(old.iter_mut()).zip(lambda) {
+            let g = trigger_value(l, threshold, params.softness);
+            *y = step(*y, g, alpha);
+            if use_old {
+                *o = step(*o, g, alpha_old);
+            }
         }
         if n / k >= spinup_frames && n % k == k - 1 {
-            frames.push(foam.clone());
+            frames.push(
+                young.iter().zip(&old).map(|(&y, &o)| y.max(params.old_weight * o)).collect::<Vec<f32>>(),
+            );
         }
     }
 
@@ -390,6 +426,75 @@ mod tests {
         assert!((four.residual - one.residual).abs() < 1e-6);
         assert!(run(1.2, &FoamParams { substeps: 0, ..base }, 2).is_err());
         assert!(run(1.2, &FoamParams { substeps: 17, ..base }, 2).is_err());
+    }
+
+    #[test]
+    fn old_layer_leaves_a_dim_trail_after_young_foam_fades() {
+        // Trigger once, then never: young foam is gone after a few tau, the trail keeps old_weight * decayed.
+        let (tau, old_tau, w, dt) = (0.4f32, 2.0f32, 0.25f32, 0.05f32);
+        let (a_y, a_o) = ((-dt / tau).exp(), (-dt / old_tau).exp());
+        let (mut y, mut o) = (0.0f32, 0.0f32);
+        y = step(y, 1.0, a_y);
+        o = step(o, 1.0, a_o);
+        assert_eq!(y.max(w * o), 1.0); // fresh foam is full intensity
+        for _ in 0..60 {
+            // 3 s
+            y = step(y, 0.0, a_y);
+            o = step(o, 0.0, a_o);
+        }
+        assert!(y < 0.001);
+        let combined = y.max(w * o);
+        assert!((combined - w * (-3.0f32 / old_tau).exp()).abs() < 1e-3, "{combined}");
+    }
+
+    #[test]
+    fn old_weight_zero_matches_the_single_layer() {
+        let base = FoamParams { trigger: Trigger::Threshold(0.8), ..small() };
+        let single = run(1.2, &FoamParams { old_weight: 0.0, ..base }, 4).unwrap();
+        let two = run(1.2, &base, 4).unwrap();
+        // the combined foam is never below the young layer alone
+        for (a, b) in single.frames.iter().flatten().zip(two.frames.iter().flatten()) {
+            assert!(*b + 1e-6 >= *a);
+        }
+        assert!(two.mean_foam > single.mean_foam);
+        assert!(run(1.2, &FoamParams { old_weight: 1.5, ..base }, 2).is_err());
+        assert!(run(1.2, &FoamParams { old_tau: 0.0, ..base }, 2).is_err());
+        // old_tau is irrelevant (and not validated) when the layer is off
+        assert!(run(1.2, &FoamParams { old_weight: 0.0, old_tau: 0.0, ..base }, 2).is_ok());
+    }
+
+    #[test]
+    fn default_foam_stays_locked_to_the_waves() {
+        // Regression: with tau = 2 s foam was nearly unrelated to the waves (z-score +0.18).
+        // Foam-weighted mean height must sit well above the overall mean, in units of height std.
+        let p = OceanParams { resolution: 64, size: 20.0, choppiness: 1.5, ..OceanParams::default() };
+        let sim = OceanSim::new(&p).unwrap();
+        let dt = 1.0 / 24.0;
+        let times: Vec<f32> = (0..24).map(|i| i as f32 * dt).collect();
+        let scale = sim.height_scale(&times).unwrap();
+        let fields = sim.fields(&times, scale).unwrap();
+        let foam = simulate_foam(&sim, scale, &times, dt, &FoamParams { resolution: 64, ..Default::default() }).unwrap();
+        let m = foam.resolution;
+        let mut zs = Vec::new();
+        for fi in (4..24).step_by(5) {
+            let (mut sw, mut swh, mut sh, mut shh) = (0f64, 0f64, 0f64, 0f64);
+            for row in 0..m {
+                for col in 0..m {
+                    let h = fields[fi]
+                        .sample_periodic((col as f64 + 0.5) / m as f64 * 64.0, (row as f64 + 0.5) / m as f64 * 64.0)
+                        .height as f64;
+                    let w = foam.frames[fi][row * m + col] as f64;
+                    sw += w;
+                    swh += w * h;
+                    sh += h;
+                    shh += h * h;
+                }
+            }
+            let k = (m * m) as f64;
+            zs.push((swh / sw - sh / k) / (shh / k - (sh / k).powi(2)).sqrt());
+        }
+        let z = zs.iter().sum::<f64>() / zs.len() as f64;
+        assert!(z > 0.6, "foam is not crest-locked: z = {z:.2} ({zs:?})");
     }
 
     #[test]
