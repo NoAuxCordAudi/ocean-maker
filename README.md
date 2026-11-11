@@ -70,6 +70,14 @@ blender --python ocean_foam/ocean_blender.py
   decayed exponentially (`--foam-tau`, default 2 s) and spun up before frame 0. `--foam-coverage`
   (default 0.02) is the per-frame fraction of the surface that triggers; the threshold is
   calibrated to it. Foam stays at fixed points, so it trails behind crests.
+- `--foam-embed` makes a **one-file GLB** instead: all foam frames are baked into a single
+  base-colour atlas texture (foam blended into the water colour, wrapped gutters so filtering
+  never bleeds between frames), selected per frame by `KHR_texture_transform` and stepped by a
+  `KHR_animation_pointer` channel in sync with the morph targets. No sidecar files. In Blender
+  4.2+ enable the experimental *Animation Pointer* option in the glTF import dialog. Viewers
+  without pointer support show the first frame's foam statically. Foam appears as base colour
+  only (no roughness change, no noise breakup), and the file is larger (45 MB for 4 s at 24 fps
+  with 256² foam). **Not yet verified in Blender**: only the file structure is tested.
 - Morph targets cannot carry foam into Blender (its importer reads POSITION deltas only), hence
   the sidecar images. All tiles show the same foam.
 - `--foam-coverage physical` uses the Monahan & O'Muircheartaigh (1980) whitecap fraction for

@@ -88,3 +88,12 @@ Not done, with reasons:
   section 2, 20 m patch). Foam coverage is therefore set by calibration, not by wind.
 - **In-GLB foam atlas** (KHR_animation_pointer) — deferred, as proposed.
 - Bump/roughness-from-foam look-dev — left to the artist in Blender.
+
+## One-file GLB (`--foam-embed`)
+Implemented as proposed (atlas + `KHR_texture_transform` + `KHR_animation_pointer`, STEP).
+Verified by tests on the file structure only: extensions are *used* not *required*, the pointer
+channel has no `node`, STEP sampler, VEC2 offsets equal the atlas layout, sampler clamps,
+wrapped gutters, tile instancing intact. **Not run in Blender** (running a downloaded Blender
+was not permitted in this session). Still to confirm there: that the importer applies the
+pointer-animated texture offset (needs the "Animation Pointer" import option, Blender 4.2+),
+that STEP behaves, and the V orientation of the imported mapping.

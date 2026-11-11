@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use ocean_generator::export::{export_glb, morph_data_bytes, write_foam_sequence, Animation, FoamExport};
+use ocean_generator::export::{export_glb_with, morph_data_bytes, write_foam_sequence, Animation, FoamExport};
 use ocean_generator::foam::{mom80, simulate_foam, FoamParams, Trigger};
 use ocean_generator::mesh::{flat_grid, max_seam_error, ocean_mesh, GridSpec, MeshData, SEAM_TOLERANCE};
 use ocean_generator::tessendorf;
@@ -125,6 +125,12 @@ struct Args {
     /// Do not write ocean_blender.py
     #[arg(long, requires = "foam")]
     no_blender_script: bool,
+
+    /// Embed the foam in the GLB itself (one file, no sidecar files): a base-colour atlas
+    /// animated with KHR_animation_pointer. In Blender 4.2+ enable the experimental
+    /// "Animation Pointer" option in the glTF import dialog. Foam shows as base colour only.
+    #[arg(long, requires = "foam", conflicts_with_all = ["foam_dir", "no_blender_script", "foam_noise"])]
+    foam_embed: bool,
 }
 
 /// `--foam-coverage`: a fraction in (0, 1) or the literal `physical`.
@@ -259,45 +265,61 @@ fn main() -> Result<()> {
     report_amplitude(&meshes, args.amplitude);
     check_seams(&meshes, &grid, &params, args.tiles)?;
 
+    // Foam is simulated before the export so it can be embedded in the GLB.
+    let foam_seq = match &foam {
+        Some(fp) => {
+            let dt = 1.0 / args.anim_fps;
+            println!("Simulating foam ({} texel resolution, tau {}s)...", fp.resolution, fp.tau);
+            let seq = simulate_foam(&sim, scale, &times, dt, fp)?;
+            println!(
+                "Foam: threshold {:.3}, {:.2}% of texel-frames trigger, mean foam {:.3}, \
+                 {} spin-up frames (residual {:.3})",
+                seq.threshold,
+                seq.trigger_fraction * 100.0,
+                seq.mean_foam,
+                seq.spinup_frames,
+                seq.residual
+            );
+            Some(seq)
+        }
+        None => None,
+    };
+
     println!("Exporting to {} ({}x{} tiles)...", args.output.display(), args.tiles, args.tiles);
+    let embedded = if args.foam_embed { foam_seq.as_ref() } else { None };
     match args.anim_duration {
         Some(_) => {
             let rest_pose = flat_grid(&grid);
             let animation = Animation { fps: args.anim_fps, frames: &meshes };
-            export_glb(&rest_pose, Some(animation), &grid, args.tiles, &args.output)?;
+            export_glb_with(&rest_pose, Some(animation), embedded, &grid, args.tiles, &args.output)?;
         }
-        None => export_glb(&meshes[0], None, &grid, args.tiles, &args.output)?,
+        None => export_glb_with(&meshes[0], None, embedded, &grid, args.tiles, &args.output)?,
     }
 
-    if let Some(fp) = foam {
-        let dt = 1.0 / args.anim_fps;
-        println!("Simulating foam ({} texel resolution, tau {}s)...", fp.resolution, fp.tau);
-        let seq = simulate_foam(&sim, scale, &times, dt, &fp)?;
-        println!(
-            "Foam: threshold {:.3}, {:.2}% of texel-frames trigger, mean foam {:.3}, \
-             {} spin-up frames (residual {:.3})",
-            seq.threshold,
-            seq.trigger_fraction * 100.0,
-            seq.mean_foam,
-            seq.spinup_frames,
-            seq.residual
-        );
-        let dir = args.foam_dir.clone().unwrap_or_else(|| default_foam_dir(&args.output));
-        let shape_keys = if args.anim_duration.is_some() { meshes.len() } else { 0 };
-        let export = FoamExport {
-            sequence: &seq,
-            params: &fp,
-            fps: args.anim_fps,
-            glb_path: &args.output,
-            shape_keys,
-            write_blender_script: !args.no_blender_script,
-            noise_breakup: args.foam_noise,
-        };
-        write_foam_sequence(&dir, &export)
-            .with_context(|| format!("failed to write foam files to {}", dir.display()))?;
-        println!("Foam files written to {}", dir.display());
-        if !args.no_blender_script {
-            println!("In Blender: blender --python {}", dir.join("ocean_blender.py").display());
+    if let (Some(fp), Some(seq)) = (&foam, &foam_seq) {
+        if args.foam_embed {
+            println!("Foam embedded in the GLB (atlas of {} frames).", seq.frames.len());
+            if args.anim_duration.is_some() {
+                println!("In Blender: enable the experimental 'Animation Pointer' option in the glTF import dialog.");
+            }
+        } else {
+            let dir = args.foam_dir.clone().unwrap_or_else(|| default_foam_dir(&args.output));
+            let shape_keys = if args.anim_duration.is_some() { meshes.len() } else { 0 };
+            let export = FoamExport {
+                sequence: seq,
+                params: fp,
+                fps: args.anim_fps,
+                glb_path: &args.output,
+                shape_keys,
+                write_blender_script: !args.no_blender_script,
+                noise_breakup: args.foam_noise,
+            };
+            write_foam_sequence(&dir, &export)
+                .with_context(|| format!("failed to write foam files to {}", dir.display()))?;
+            println!("Foam files written to {}", dir.display());
+            if !args.no_blender_script {
+                println!("In Blender: blender --python {}", dir.join("ocean_blender.py").display());
+            }
         }
     }
 

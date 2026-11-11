@@ -9,9 +9,16 @@ use std::path::Path;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use sha2::{Digest, Sha256};
+use mesh_tools::material::MaterialBuilder;
 use mesh_tools::mesh::MeshBuilder;
-use mesh_tools::{AnimationPath, GltfBuilder, InterpolationType, MorphTarget};
+use mesh_tools::texture::TextureFormat;
+use mesh_tools::{
+    AccessorSpec, AccessorType, AnimationPath, BufferEncoding, Bounds, ExtensionTarget, GltfBuilder,
+    InterpolationType, MagFilter, MinFilter, MorphTarget, SamplerDesc, TextureSlot, WrapMode,
+};
+use serde_json::{json, Value};
 
+use crate::atlas::{encode_rgb_png, render_atlas, AtlasLayout};
 use crate::foam::{FoamParams, FoamSequence};
 use crate::mesh::{GridSpec, MeshData};
 
@@ -63,13 +70,46 @@ pub fn export_glb(
     tiles: usize,
     output_path: &Path,
 ) -> Result<()> {
+    export_glb_with(base, animation, None, grid, tiles, output_path)
+}
+
+/// Linear-light colours baked into the foam atlas.
+const WATER_COLOR: [f32; 3] = [0.0, 0.3, 0.8];
+const FOAM_COLOR: [f32; 3] = [0.9, 0.9, 0.9];
+const FOAM_ROUGHNESS: f32 = 0.35;
+
+/// Like [`export_glb`], and with `foam` the foam is embedded in the GLB (one self-contained file).
+///
+/// All foam frames are baked into one base-colour atlas texture (see [`crate::atlas`]); the
+/// material's `KHR_texture_transform` offset selects a frame and, for an animation, a
+/// `KHR_animation_pointer` channel (STEP) steps the offset in sync with the morph-target weights.
+/// Viewers without pointer-animation support show the first frame's foam statically. Foam needs
+/// the same number of frames as the animation (1 for a still).
+pub fn export_glb_with(
+    base: &MeshData,
+    animation: Option<Animation<'_>>,
+    foam: Option<&FoamSequence>,
+    grid: &GridSpec,
+    tiles: usize,
+    output_path: &Path,
+) -> Result<()> {
     ensure!(tiles >= 1, "tiles must be at least 1");
+    if let Some(f) = foam {
+        let want = animation.as_ref().map_or(1, |a| a.frames.len());
+        ensure!(f.frames.len() == want, "foam has {} frames but the animation has {want}", f.frames.len());
+    }
     let path_str = output_path
         .to_str()
         .ok_or_else(|| anyhow!("output path is not valid UTF-8: {}", output_path.display()))?;
 
     let mut builder = GltfBuilder::new();
-    let material = builder.create_basic_material(Some("OceanMaterial".to_string()), [0.0, 0.3, 0.8, 1.0]);
+    let (material, atlas) = match foam {
+        None => (builder.create_basic_material(Some("OceanMaterial".to_string()), [0.0, 0.3, 0.8, 1.0]), None),
+        Some(f) => {
+            let (material, layout) = add_foam_material(&mut builder, f)?;
+            (material, Some(layout))
+        }
+    };
 
     let mut mesh_builder = MeshBuilder::new(Some("OceanSurface".to_string()))
         .with_positions(flatten(base.positions.iter().copied()))
@@ -127,9 +167,115 @@ pub fn export_glb(
         }
     }
 
+    // Offset animation (needs patching into the JSON after validation, see below).
+    let mut pointer_channel = None;
+    if let (Some(layout), Some(anim)) = (&atlas, &animation) {
+        let times: Vec<f32> = (0..anim.frames.len()).map(|i| i as f32 / anim.fps).collect();
+        let offsets: Vec<f32> = (0..anim.frames.len()).flat_map(|i| layout.uv_transform(i).0).collect();
+        let input = builder
+            .add_accessor_from_slice(&times, AccessorType::Scalar, AccessorSpec::new().with_bounds(Bounds::Compute))?;
+        let output = builder.add_accessor_from_slice(&offsets, AccessorType::Vec2, AccessorSpec::new())?;
+        let animation_index = builder.gltf.animations.as_ref().map_or(0, |a| a.len()) - 1;
+        let sampler = builder.add_animation_sampler(animation_index, input, output, InterpolationType::Step)?;
+        pointer_channel = Some((animation_index, sampler, material));
+    }
+
     builder.add_scene(Some("Ocean Tiles Scene".to_string()), Some(node_indices));
-    builder.export_glb(path_str)?;
+    match pointer_channel {
+        None => builder.export_glb(path_str)?,
+        Some((animation_index, sampler, material)) => {
+            builder.declare_extension_used("KHR_animation_pointer")?;
+            let parts = builder.to_gltf_parts(&BufferEncoding::Glb)?;
+            let mut doc: Value = serde_json::from_str(&parts.json)?;
+            add_pointer_channel(&mut doc, animation_index, sampler, material)?;
+            fs::write(output_path, glb_container(&serde_json::to_string(&doc)?, &parts.bin))
+                .with_context(|| format!("cannot write {}", output_path.display()))?;
+        }
+    }
     Ok(())
+}
+
+/// Embed the foam atlas and create the base-colour-textured material; returns the material index.
+fn add_foam_material(builder: &mut GltfBuilder, foam: &FoamSequence) -> Result<(usize, AtlasLayout)> {
+    let layout = AtlasLayout::new(foam.frames.len(), foam.resolution)?;
+    let pixels = render_atlas(&layout, &foam.frames, WATER_COLOR, FOAM_COLOR)?;
+    let png = encode_rgb_png(&pixels, layout.width(), layout.height())?;
+
+    let image = builder.add_image_bytes(Some("FoamAtlas".to_string()), TextureFormat::PNG, &png)?;
+    // Cells are separated by wrapped gutters, so clamp (never wrap into another cell) and keep
+    // filtering linear without mipmaps (a mip chain would blend neighbouring cells).
+    let sampler = builder.add_sampler(SamplerDesc {
+        mag_filter: Some(MagFilter::Linear),
+        min_filter: Some(MinFilter::Linear),
+        wrap_s: Some(WrapMode::ClampToEdge),
+        wrap_t: Some(WrapMode::ClampToEdge),
+    });
+    let texture = builder.add_texture(Some("FoamAtlas".to_string()), image, Some(sampler))?;
+    let material = builder.add_material_from(
+        MaterialBuilder::new(Some("OceanFoamMaterial".to_string()))
+            .with_base_color_texture(texture)
+            .with_metallic_factor(0.0)
+            .with_roughness_factor(FOAM_ROUGHNESS)
+            .build(),
+    )?;
+
+    let (offset, scale) = layout.uv_transform(0);
+    builder.set_extension(
+        ExtensionTarget::MaterialTexture { material, slot: TextureSlot::BaseColor },
+        "KHR_texture_transform",
+        json!({ "offset": offset, "scale": scale }),
+    )?;
+    Ok((material, layout))
+}
+
+/// Append a `KHR_animation_pointer` channel driving the base-colour texture offset.
+///
+/// Pointer channels must not have a `target.node`, which the typed builder always writes, hence
+/// the JSON patch.
+fn add_pointer_channel(doc: &mut Value, animation: usize, sampler: usize, material: usize) -> Result<()> {
+    let channels = doc
+        .pointer_mut(&format!("/animations/{animation}"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("animation {animation} missing from the document"))?
+        .entry("channels")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("animation channels is not an array"))?;
+    channels.push(json!({
+        "sampler": sampler,
+        "target": {
+            "path": "pointer",
+            "extensions": { "KHR_animation_pointer": {
+                "pointer": format!(
+                    "/materials/{material}/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/offset"
+                )
+            } }
+        }
+    }));
+    Ok(())
+}
+
+/// Assemble a GLB container: JSON chunk (space-padded) then BIN chunk (zero-padded).
+fn glb_container(json: &str, bin: &[u8]) -> Vec<u8> {
+    let pad = |n: usize| (4 - n % 4) % 4;
+    let (jp, bp) = (pad(json.len()), pad(bin.len()));
+    let mut out = Vec::with_capacity(28 + json.len() + jp + bin.len() + bp);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]); // total length, patched below
+    out.extend_from_slice(&((json.len() + jp) as u32).to_le_bytes());
+    out.extend_from_slice(&0x4E4F534Au32.to_le_bytes());
+    out.extend_from_slice(json.as_bytes());
+    out.resize(out.len() + jp, 0x20);
+    if !bin.is_empty() {
+        out.extend_from_slice(&((bin.len() + bp) as u32).to_le_bytes());
+        out.extend_from_slice(&0x004E4942u32.to_le_bytes());
+        out.extend_from_slice(bin);
+        out.resize(out.len() + bp, 0);
+    }
+    let total = out.len() as u32;
+    out[8..12].copy_from_slice(&total.to_le_bytes());
+    out
 }
 
 /// Companion Blender script, written next to the foam images.
@@ -503,5 +649,140 @@ mod tests {
     fn blender_script_is_self_contained() {
         assert!(BLENDER_SCRIPT.contains("def load_and_verify"));
         assert!(BLENDER_SCRIPT.contains("import bpy  # only available inside Blender"));
+    }
+
+    // ---- embedded foam atlas (one-file GLB) ----
+
+    /// Parse a GLB container into (JSON, BIN), checking the framing.
+    fn read_glb(path: &Path) -> (Value, Vec<u8>) {
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(&bytes[..4], b"glTF");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize, bytes.len());
+        let jl = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[16..20], b"JSON");
+        assert_eq!(jl % 4, 0);
+        let json: Value = serde_json::from_slice(&bytes[20..20 + jl]).unwrap();
+        let rest = &bytes[20 + jl..];
+        let bl = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        assert_eq!(&rest[4..8], b"BIN\0");
+        assert_eq!(bl % 4, 0);
+        assert_eq!(rest.len(), 8 + bl);
+        (json, rest[8..].to_vec())
+    }
+
+    fn floats(doc: &Value, bin: &[u8], accessor: usize) -> (String, usize, Vec<f32>) {
+        let a = &doc["accessors"][accessor];
+        assert_eq!(a["componentType"], 5126);
+        let view = &doc["bufferViews"][a["bufferView"].as_u64().unwrap() as usize];
+        let start = view["byteOffset"].as_u64().unwrap_or(0) as usize + a["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let count = a["count"].as_u64().unwrap() as usize;
+        let comps = match a["type"].as_str().unwrap() { "SCALAR" => 1, "VEC2" => 2, "VEC3" => 3, t => panic!("{t}") };
+        let vals = (0..count * comps)
+            .map(|i| f32::from_le_bytes(bin[start + 4 * i..start + 4 * i + 4].try_into().unwrap()))
+            .collect();
+        (a["type"].as_str().unwrap().to_string(), count, vals)
+    }
+
+    fn foam_for(n: usize) -> FoamSequence {
+        let frames = (0..n).map(|f| (0..16).map(|i| ((i + f) % 5) as f32 / 4.0).collect()).collect();
+        sequence(frames, 4)
+    }
+
+    #[test]
+    fn embedded_foam_animation_has_atlas_transform_and_pointer_channel() {
+        let fx = fixture(8);
+        let n = fx.frames.len();
+        let foam = foam_for(n);
+        let path = tmp("atlas_anim");
+        let anim = Animation { fps: 4.0, frames: &fx.frames };
+        export_glb_with(&fx.base, Some(anim), Some(&foam), &fx.grid, 3, &path).unwrap();
+        let (doc, bin) = read_glb(&path);
+        fs::remove_file(&path).unwrap();
+
+        let used: Vec<&str> = doc["extensionsUsed"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(used.contains(&"KHR_texture_transform") && used.contains(&"KHR_animation_pointer"), "{used:?}");
+        assert!(doc.get("extensionsRequired").is_none(), "extensions must stay optional");
+
+        // one embedded PNG image of the atlas size
+        let layout = AtlasLayout::new(n, 4).unwrap();
+        assert_eq!(doc["images"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["images"][0]["mimeType"], "image/png");
+        let view = &doc["bufferViews"][doc["images"][0]["bufferView"].as_u64().unwrap() as usize];
+        let (off, len) = (view["byteOffset"].as_u64().unwrap_or(0) as usize, view["byteLength"].as_u64().unwrap() as usize);
+        let reader = png::Decoder::new(&bin[off..off + len]).read_info().unwrap();
+        assert_eq!((reader.info().width as usize, reader.info().height as usize), (layout.width(), layout.height()));
+
+        // sampler clamps (no wrapping into neighbouring cells)
+        assert_eq!(doc["samplers"][0]["wrapS"], 33071);
+        assert_eq!(doc["samplers"][0]["wrapT"], 33071);
+
+        // material uses the texture with frame 0's transform
+        let bct = &doc["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"];
+        let (o0, s0) = layout.uv_transform(0);
+        let tt = &bct["extensions"]["KHR_texture_transform"];
+        assert_eq!(tt["offset"], json!(o0));
+        assert_eq!(tt["scale"], json!(s0));
+        assert_eq!(doc["materials"].as_array().unwrap().len(), 1);
+
+        // exactly one pointer channel (no node), STEP, VEC2 offsets that match the layout
+        let channels = doc["animations"][0]["channels"].as_array().unwrap();
+        let pointers: Vec<_> = channels.iter().filter(|c| c["target"]["path"] == "pointer").collect();
+        assert_eq!(pointers.len(), 1);
+        assert_eq!(channels.len(), 9 + 1, "9 tile weight channels + 1 pointer channel");
+        let target = &pointers[0]["target"];
+        assert!(target.get("node").is_none(), "pointer channels must not name a node");
+        assert_eq!(
+            target["extensions"]["KHR_animation_pointer"]["pointer"],
+            "/materials/0/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/offset"
+        );
+        let sampler = &doc["animations"][0]["samplers"][pointers[0]["sampler"].as_u64().unwrap() as usize];
+        assert_eq!(sampler["interpolation"], "STEP");
+        let (ty, count, offs) = floats(&doc, &bin, sampler["output"].as_u64().unwrap() as usize);
+        assert_eq!((ty.as_str(), count), ("VEC2", n));
+        let want: Vec<f32> = (0..n).flat_map(|i| layout.uv_transform(i).0).collect();
+        assert_eq!(offs, want);
+        let (_, tc, times) = floats(&doc, &bin, sampler["input"].as_u64().unwrap() as usize);
+        assert_eq!(tc, n);
+        assert_eq!(times, (0..n).map(|i| i as f32 / 4.0).collect::<Vec<_>>());
+        // morph weights channels are untouched
+        assert_eq!(channels.iter().filter(|c| c["target"]["path"] == "weights").count(), 9);
+    }
+
+    #[test]
+    fn embedded_foam_still_has_static_transform_and_no_pointer() {
+        let fx = fixture(8);
+        let foam = foam_for(1);
+        let path = tmp("atlas_still");
+        export_glb_with(&fx.frames[0], None, Some(&foam), &fx.grid, 2, &path).unwrap();
+        let (doc, _) = read_glb(&path);
+        fs::remove_file(&path).unwrap();
+        assert!(doc.get("animations").is_none());
+        let used = doc["extensionsUsed"].as_array().unwrap();
+        assert!(used.iter().any(|v| v == "KHR_texture_transform"));
+        assert!(!used.iter().any(|v| v == "KHR_animation_pointer"));
+        assert!(doc["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["extensions"]["KHR_texture_transform"]["offset"].is_array());
+    }
+
+    #[test]
+    fn without_foam_the_material_stays_untextured() {
+        let fx = fixture(8);
+        let path = tmp("nofoam");
+        export_glb(&fx.frames[0], None, &fx.grid, 1, &path).unwrap();
+        let (doc, _) = read_glb(&path);
+        fs::remove_file(&path).unwrap();
+        assert!(doc.get("images").is_none());
+        assert!(doc["materials"][0]["pbrMetallicRoughness"].get("baseColorTexture").is_none());
+    }
+
+    #[test]
+    fn embedded_foam_rejects_mismatched_frames() {
+        let fx = fixture(8);
+        let path = tmp("atlas_bad");
+        let anim = Animation { fps: 4.0, frames: &fx.frames };
+        let err = export_glb_with(&fx.base, Some(anim), Some(&foam_for(2)), &fx.grid, 1, &path).unwrap_err();
+        assert!(err.to_string().contains("foam has 2 frames"), "{err}");
+        assert!(export_glb_with(&fx.frames[0], None, Some(&foam_for(3)), &fx.grid, 1, &path).is_err());
+        assert!(!path.exists());
     }
 }
