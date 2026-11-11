@@ -5,3 +5,4 @@
 Cargo.lock
 *.gif
 tests/ref/.venv
+*_foam/
