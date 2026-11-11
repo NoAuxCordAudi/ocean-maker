@@ -58,3 +58,8 @@ With Repeat extension and a periodic texture this is consistent; no change neede
 
 ## 5. mesh-tools 0.22 extras / textures / extensions
 Not investigated: only matters for the deferred in-GLB atlas.
+
+## Phase 1 outcome
+The sign was flipped (`DISPLACEMENT_SIGN = +1`). `tessendorf::verify_fold_sign` (a test, also
+public) now measures corr(height, div D) < 0 on real output. Mesh geometry changed: choppiness
+now sharpens crests instead of spreading them.

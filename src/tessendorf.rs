@@ -179,6 +179,14 @@ fn dispersion(k: f32, params: &OceanParams) -> f32 {
     base_dispersion
 }
 
+/// Sign of the choppy horizontal displacement spectrum: `D~ = SIGN * i * k_hat * h~`.
+///
+/// With rustfft's `e^{+ik.x}` inverse transform, `+i` makes `D = -k_hat * a * sin(theta)` for
+/// `h = a * cos(theta)`, i.e. horizontal motion converges on crests (they sharpen) as in real
+/// deep-water waves. The Jacobian uses the same constant so mesh and foam always agree. See
+/// `docs/whitecaps-spikes.md`; [`verify_fold_sign`] checks it on real output.
+const DISPLACEMENT_SIGN: f32 = 1.0;
+
 /// Unscaled spatial-domain fields for one instant.
 struct RawFields {
     height: Vec<Vec<f32>>,
@@ -186,6 +194,31 @@ struct RawFields {
     slope_y: Vec<Vec<f32>>,
     disp_x: Vec<Vec<f32>>,
     disp_y: Vec<Vec<f32>>,
+}
+
+/// Wave vector of FFT bin `(i, j)`, its unit direction, and the evolved spectrum `h~(k, t)`.
+fn spectrum_at(
+    params: &OceanParams,
+    h0: &[Vec<Complex32>],
+    i: usize,
+    j: usize,
+    time: f32,
+) -> (Vec2, Vec2, Complex32) {
+    let n = params.resolution;
+    let k = Vec2::new(
+        2.0 * PI * fft_freq(i, n) / params.size,
+        2.0 * PI * fft_freq(j, n) / params.size,
+    );
+    let k_length = k.length();
+    let k_hat = if k_length > 1e-6 { k / k_length } else { Vec2::new(1.0, 0.0) };
+
+    let omega = dispersion(k_length, params);
+    let exp_term = Complex32::new(0.0, omega * time).exp();
+    let exp_term_conj = Complex32::new(0.0, -omega * time).exp();
+
+    let h0_k = h0[i][j];
+    let h0_conj_neg_k = Complex32::new(h0_k.re, -h0_k.im);
+    (k, k_hat, h0_k * exp_term + h0_conj_neg_k * exp_term_conj)
 }
 
 /// Evolve `h0` to `time` and inverse-transform all fields.
@@ -205,25 +238,15 @@ fn raw_fields(
 
     for i in 0..n {
         for j in 0..n {
-            let k_x = 2.0 * PI * fft_freq(i, n) / params.size;
-            let k_y = 2.0 * PI * fft_freq(j, n) / params.size;
-            let k = Vec2::new(k_x, k_y);
-            let k_length = k.length();
-            let k_hat = if k_length > 1e-6 { k / k_length } else { Vec2::new(1.0, 0.0) };
-
-            let omega = dispersion(k_length, params);
-            let exp_term = Complex32::new(0.0, omega * time).exp();
-            let exp_term_conj = Complex32::new(0.0, -omega * time).exp();
-
-            let h0_k = h0[i][j];
-            let h0_conj_neg_k = Complex32::new(h0_k.re, -h0_k.im);
-            let h_tilde = h0_k * exp_term + h0_conj_neg_k * exp_term_conj;
-
+            let (k, k_hat, h_tilde) = spectrum_at(params, h0, i, j, time);
             height_field[i][j] = h_tilde; // Eq. 19
             slope_x_field[i][j] = Complex32::new(0.0, k.x) * h_tilde; // Eq. 20
             slope_y_field[i][j] = Complex32::new(0.0, k.y) * h_tilde;
-            disp_x_field[i][j] = Complex32::new(0.0, -k_hat.x) * h_tilde * params.choppiness; // Eq. 29
-            disp_y_field[i][j] = Complex32::new(0.0, -k_hat.y) * h_tilde * params.choppiness;
+            // Eq. 29, sign per DISPLACEMENT_SIGN
+            disp_x_field[i][j] =
+                Complex32::new(0.0, DISPLACEMENT_SIGN * k_hat.x) * h_tilde * params.choppiness;
+            disp_y_field[i][j] =
+                Complex32::new(0.0, DISPLACEMENT_SIGN * k_hat.y) * h_tilde * params.choppiness;
         }
     }
 
@@ -297,6 +320,170 @@ pub fn frame_times(start: f32, duration: f32, fps: f32) -> Result<Vec<f32>> {
     Ok((0..=intervals).map(|i| start + i as f32 / fps).collect())
 }
 
+fn ensure_finite_times(times: &[f32]) -> Result<()> {
+    ensure!(!times.is_empty(), "at least one time is required");
+    ensure!(times.iter().all(|t| t.is_finite()), "times must be finite");
+    Ok(())
+}
+
+/// Jacobian of the horizontal map `x -> x + D(x)` on a (possibly oversampled) grid.
+#[derive(Debug, Clone)]
+pub struct JacobianField {
+    pub resolution: usize,
+    /// Smaller eigenvalue of the symmetric Jacobian `[[1+Dxx, Dxy], [Dxy, 1+Dyy]]`.
+    /// 1 = undistorted, 0 = crest of a fold forming, < 0 = the surface has folded over.
+    pub lambda_min: Vec<Vec<f32>>,
+    /// `det J`; negative where the displaced mesh folds (a diagnostic).
+    pub det: Vec<Vec<f32>>,
+}
+
+/// One ocean realisation (spectrum fixed by `params.seed`) that can be evaluated at any time.
+///
+/// All evaluations must share one height `scale` (see [`OceanSim::height_scale`]) so that
+/// frames, and fields derived from them, are mutually consistent.
+pub struct OceanSim {
+    params: OceanParams,
+    h0: Vec<Vec<Complex32>>,
+}
+
+impl OceanSim {
+    /// # Errors
+    /// If `params` has a resolution below 2 or a non-positive size.
+    pub fn new(params: &OceanParams) -> Result<Self> {
+        Self::validate(params)?;
+        Ok(Self { params: params.clone(), h0: generate_h0(params) })
+    }
+
+    fn validate(params: &OceanParams) -> Result<()> {
+        ensure!(params.resolution >= 2, "resolution must be at least 2, got {}", params.resolution);
+        ensure!(params.size.is_finite() && params.size > 0.0, "size must be > 0, got {}", params.size);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_h0(params: &OceanParams, h0: Vec<Vec<Complex32>>) -> Self {
+        Self { params: params.clone(), h0 }
+    }
+
+    /// Single height scale such that the largest peak-to-peak height over `times` is
+    /// `2 * amplitude`.
+    ///
+    /// # Errors
+    /// If `times` is empty or non-finite.
+    pub fn height_scale(&self, times: &[f32]) -> Result<f32> {
+        ensure_finite_times(times)?;
+        let mut planner = FftPlanner::new();
+        let n = self.params.resolution;
+        let mut current_range = 0.0f32;
+        for &t in times {
+            let mut field = vec![vec![Complex32::new(0.0, 0.0); n]; n];
+            for (i, row) in field.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    *cell = spectrum_at(&self.params, &self.h0, i, j, t).2;
+                }
+            }
+            current_range = current_range.max(height_range(&ifft2d(&mut planner, field)));
+        }
+        let target_range = self.params.amplitude * 2.0;
+        Ok(if current_range > 1e-6 { target_range / current_range } else { self.params.amplitude })
+    }
+
+    /// Displacement fields at `times`, all scaled by `scale`.
+    ///
+    /// # Errors
+    /// If `times` is empty or non-finite.
+    pub fn fields(&self, times: &[f32], scale: f32) -> Result<Vec<DisplacementField>> {
+        ensure_finite_times(times)?;
+        let mut planner = FftPlanner::new();
+        Ok(times
+            .iter()
+            .map(|&t| finish_field(raw_fields(&self.params, &self.h0, t, &mut planner), scale))
+            .collect())
+    }
+
+    /// Jacobian of the displacement map at `times`, on an `out_resolution`² grid.
+    ///
+    /// The three second-derivative fields `D_ab = IFFT[-SIGN * c * s * k_a k_b / |k| * h~]` are
+    /// computed spectrally (exact and periodic). When `out_resolution > resolution` the spectrum
+    /// is zero-padded, which band-limit interpolates the *linear* fields; the nonlinear
+    /// eigenvalue is then evaluated on the finer grid. Values at coincident grid points equal the
+    /// coarse values (the unnormalised sum is unchanged, so no `(M/N)^2` factor is needed).
+    /// Output texel `(i, j)` lies at `x = i / out_resolution * size`.
+    ///
+    /// The Nyquist row/column is dropped (its derivative is ill-defined).
+    ///
+    /// # Errors
+    /// If `times` is empty/non-finite or `out_resolution < resolution`.
+    pub fn jacobians(&self, times: &[f32], scale: f32, out_resolution: usize) -> Result<Vec<JacobianField>> {
+        ensure_finite_times(times)?;
+        let n = self.params.resolution;
+        ensure!(out_resolution >= n, "out_resolution {out_resolution} must be >= resolution {n}");
+        let mut planner = FftPlanner::new();
+        let c = self.params.choppiness * scale;
+        let is_nyquist = |idx: usize| n.is_multiple_of(2) && idx == n / 2;
+
+        Ok(times
+            .iter()
+            .map(|&t| {
+                let zero = || vec![vec![Complex32::new(0.0, 0.0); n]; n];
+                let (mut xx, mut yy, mut xy) = (zero(), zero(), zero());
+                for i in 0..n {
+                    for j in 0..n {
+                        if is_nyquist(i) || is_nyquist(j) {
+                            continue;
+                        }
+                        let (k, _, h) = spectrum_at(&self.params, &self.h0, i, j, t);
+                        let kl = k.length();
+                        if kl < 1e-6 {
+                            continue;
+                        }
+                        let m = -DISPLACEMENT_SIGN * c / kl;
+                        xx[i][j] = h * (m * k.x * k.x);
+                        yy[i][j] = h * (m * k.y * k.y);
+                        xy[i][j] = h * (m * k.x * k.y);
+                    }
+                }
+                // Keep the coarse 1/N^2 normalisation so values match the coarse fields.
+                let norm = 1.0 / (n * n) as f32;
+                let dxx = ifft_square(&mut planner, pad_spectrum(&xx, out_resolution), norm);
+                let dyy = ifft_square(&mut planner, pad_spectrum(&yy, out_resolution), norm);
+                let dxy = ifft_square(&mut planner, pad_spectrum(&xy, out_resolution), norm);
+
+                let m = out_resolution;
+                let mut lambda_min = vec![vec![0.0f32; m]; m];
+                let mut det = vec![vec![0.0f32; m]; m];
+                for i in 0..m {
+                    for j in 0..m {
+                        let (jxx, jyy, jxy) = (1.0 + dxx[i][j] as f64, 1.0 + dyy[i][j] as f64, dxy[i][j] as f64);
+                        let disc = ((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy).sqrt();
+                        lambda_min[i][j] = (0.5 * (jxx + jyy) - 0.5 * disc) as f32;
+                        det[i][j] = (jxx * jyy - jxy * jxy) as f32;
+                    }
+                }
+                JacobianField { resolution: m, lambda_min, det }
+            })
+            .collect())
+    }
+}
+
+/// Embed an `n`x`n` FFT-ordered spectrum into an `m`x`m` one (m >= n): positive frequencies stay,
+/// negative frequencies move to the top of the larger array. The Nyquist bin (if any) must
+/// already be zero.
+fn pad_spectrum(src: &[Vec<Complex32>], m: usize) -> Vec<Vec<Complex32>> {
+    let n = src.len();
+    if m == n {
+        return src.to_vec();
+    }
+    let map = |i: usize| if i < n / 2 + n % 2 { i } else { m - (n - i) };
+    let mut out = vec![vec![Complex32::new(0.0, 0.0); m]; m];
+    for (i, row) in src.iter().enumerate() {
+        for (j, v) in row.iter().enumerate() {
+            out[map(i)][map(j)] = *v;
+        }
+    }
+    out
+}
+
 /// Compute displacement fields at several instants of the same ocean.
 ///
 /// The spectrum is generated once and one amplitude scale is shared by all frames,
@@ -307,29 +494,16 @@ pub fn frame_times(start: f32, duration: f32, fps: f32) -> Result<Vec<f32>> {
 /// If `times` is empty or non-finite, or `params` has a resolution below 2 or a
 /// non-positive size.
 pub fn compute_wave_fields(params: &OceanParams, times: &[f32]) -> Result<Vec<DisplacementField>> {
-    ensure!(!times.is_empty(), "at least one time is required");
-    ensure!(times.iter().all(|t| t.is_finite()), "times must be finite");
-    ensure!(params.resolution >= 2, "resolution must be at least 2, got {}", params.resolution);
-    ensure!(params.size.is_finite() && params.size > 0.0, "size must be > 0, got {}", params.size);
-
-    let h0 = generate_h0(params);
-    let mut planner = FftPlanner::new();
-    let raws: Vec<RawFields> = times.iter().map(|&t| raw_fields(params, &h0, t, &mut planner)).collect();
-
-    let current_range = raws.iter().map(|r| height_range(&r.height)).fold(0.0f32, f32::max);
-    let target_range = params.amplitude * 2.0; // peak-to-peak should be 2 * amplitude
-    let scale = if current_range > 1e-6 {
-        target_range / current_range
-    } else {
-        // No variation at all; keep the historical fallback.
-        params.amplitude
-    };
+    ensure_finite_times(times)?;
+    let sim = OceanSim::new(params)?;
+    let scale = sim.height_scale(times)?;
     println!(
-        "Wave height scaling: {} frame(s), raw range = {:.6}, target = {:.6}, scale = {:.6}",
-        raws.len(), current_range, target_range, scale
+        "Wave height scaling: {} frame(s), target = {:.6}, scale = {:.6}",
+        times.len(),
+        params.amplitude * 2.0,
+        scale
     );
-
-    Ok(raws.into_iter().map(|r| finish_field(r, scale)).collect())
+    sim.fields(times, scale)
 }
 
 /// Compute the wave field at a single time (see [`compute_wave_fields`]).
@@ -342,10 +516,50 @@ pub fn compute_wave_field(params: &OceanParams, time: f32) -> DisplacementField 
         .remove(0)
 }
 
-/// Perform 2D inverse FFT on complex field via row-then-column 1D IFFTs.
-/// rustfft is un-normalized, so we divide by n*n at the end (one factor
-/// of n per dimension).
-fn ifft2d(planner: &mut FftPlanner<f32>, mut field: Vec<Vec<Complex32>>) -> Vec<Vec<f32>> {
+/// Check that the choppy displacement sharpens crests: the correlation between height and the
+/// horizontal divergence of `D` over the grid must be negative (crests compress). Returns the
+/// correlation. Uses periodic central differences, so it is a coarse but independent check of
+/// [`DISPLACEMENT_SIGN`] and of the Jacobian's sign convention.
+///
+/// # Errors
+/// If the correlation is not clearly negative (the sign convention is broken).
+pub fn verify_fold_sign(params: &OceanParams, time: f32) -> Result<f32> {
+    ensure!(params.choppiness > 0.0, "choppiness must be > 0 to test the displacement sign");
+    let f = compute_wave_field(params, time);
+    let n = f.resolution;
+    let dx = params.size / n as f32;
+    let w = |i: isize| (i.rem_euclid(n as isize)) as usize;
+    let (mut hs, mut ds) = (Vec::with_capacity(n * n), Vec::with_capacity(n * n));
+    for i in 0..n as isize {
+        for j in 0..n as isize {
+            let ddx = (f.displacement_x[w(i + 1)][w(j)] - f.displacement_x[w(i - 1)][w(j)]) / (2.0 * dx);
+            let ddy = (f.displacement_y[w(i)][w(j + 1)] - f.displacement_y[w(i)][w(j - 1)]) / (2.0 * dx);
+            hs.push(f.height[i as usize][j as usize] as f64);
+            ds.push((ddx + ddy) as f64);
+        }
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let (mh, md) = (mean(&hs), mean(&ds));
+    let cov: f64 = hs.iter().zip(&ds).map(|(h, d)| (h - mh) * (d - md)).sum();
+    let vh: f64 = hs.iter().map(|h| (h - mh).powi(2)).sum();
+    let vd: f64 = ds.iter().map(|d| (d - md).powi(2)).sum();
+    let corr = (cov / (vh.sqrt() * vd.sqrt())) as f32;
+    ensure!(
+        corr < -0.1,
+        "choppy displacement does not sharpen crests (corr(height, div D) = {corr:+.3}); sign convention is wrong"
+    );
+    Ok(corr)
+}
+
+/// Perform a 2D inverse FFT of the coarse `n`x`n` field, normalised by `1/n^2`.
+fn ifft2d(planner: &mut FftPlanner<f32>, field: Vec<Vec<Complex32>>) -> Vec<Vec<f32>> {
+    let n = field.len();
+    ifft_square(planner, field, 1.0 / (n * n) as f32)
+}
+
+/// 2D inverse FFT of a square field via row-then-column 1D IFFTs, returning the real part times
+/// `scale`. rustfft is un-normalised, so the caller chooses the normalisation.
+fn ifft_square(planner: &mut FftPlanner<f32>, mut field: Vec<Vec<Complex32>>, scale: f32) -> Vec<Vec<f32>> {
     let n = field.len();
     let fft = planner.plan_fft_inverse(n);
 
@@ -365,7 +579,6 @@ fn ifft2d(planner: &mut FftPlanner<f32>, mut field: Vec<Vec<Complex32>>) -> Vec<
         fft.process(col);
     }
 
-    let scale = 1.0 / (n * n) as f32;
     let mut result = vec![vec![0.0; n]; n];
     for i in 0..n {
         for j in 0..n {
@@ -475,5 +688,165 @@ mod tests {
         let s = f.sample_periodic(5.5, 9.0);
         let (a, b) = (f.height[5][9], f.height[6][9]);
         assert!(s.height >= a.min(b) - 1e-6 && s.height <= a.max(b) + 1e-6);
+    }
+
+    // ---- Jacobian / sign (phase 1) ----
+
+    fn mode_params(c: f32) -> OceanParams {
+        OceanParams { resolution: 64, size: 20.0, choppiness: c, amplitude: 1.0, ..OceanParams::default() }
+    }
+
+    /// h0 with the given (i, j, value) bins set, everything else zero.
+    fn h0_with(n: usize, bins: &[(usize, usize, Complex32)]) -> Vec<Vec<Complex32>> {
+        let mut h0 = vec![vec![Complex32::new(0.0, 0.0); n]; n];
+        for &(i, j, v) in bins {
+            h0[i][j] = v;
+        }
+        h0
+    }
+
+    #[test]
+    fn crests_compress_on_real_output() {
+        let params = OceanParams { resolution: 64, size: 20.0, choppiness: 0.5, ..OceanParams::default() };
+        let corr = verify_fold_sign(&params, 0.0).unwrap();
+        assert!(corr < -0.1, "corr {corr}");
+    }
+
+    #[test]
+    fn single_mode_matches_analytic_jacobian() {
+        let (n, c) = (64usize, 0.8f32);
+        let params = mode_params(c);
+        // One x-directed mode, bin (3, 0): h = A cos(kx), A = 2a / N^2 at t = 0.
+        let a = 40.0f32;
+        let sim = OceanSim::with_h0(&params, h0_with(n, &[(3, 0, Complex32::new(a, 0.0))]));
+        let amp = 2.0 * a / (n * n) as f32;
+        let k = 2.0 * PI * 3.0 / params.size;
+
+        let field = sim.fields(&[0.0], 1.0).unwrap().remove(0);
+        let jac = sim.jacobians(&[0.0], 1.0, n).unwrap().remove(0);
+        for i in 0..n {
+            let x = i as f32 / n as f32 * params.size;
+            let theta = k * x;
+            // crest at theta = 0: height max, displacement compresses (J < 1)
+            assert!((field.height[i][5] - amp * theta.cos()).abs() < 1e-6);
+            assert!((field.displacement_x[i][5] + c * amp * theta.sin()).abs() < 1e-6);
+            let want_det = 1.0 - c * amp * k * theta.cos();
+            assert!((jac.det[i][5] - want_det).abs() < 1e-5, "i={i} {} vs {want_det}", jac.det[i][5]);
+            assert!((jac.lambda_min[i][5] - want_det.min(1.0)).abs() < 1e-5);
+        }
+        // crest sharpening: smallest J exactly at the crest
+        assert!(jac.det[0][5] < 1.0 && jac.det[n / 6][5] > 1.0); // theta = 0 vs pi
+    }
+
+    #[test]
+    fn zero_choppiness_gives_identity_jacobian() {
+        let params = mode_params(0.0);
+        let sim = OceanSim::new(&params).unwrap();
+        let j = sim.jacobians(&[0.3], 5.0, 64).unwrap().remove(0);
+        assert!(j.lambda_min.iter().flatten().all(|&v| v == 1.0));
+        assert!(j.det.iter().flatten().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn spectral_jacobian_matches_finite_differences_on_low_k_field() {
+        let (n, c) = (64usize, 1.0f32);
+        let params = mode_params(c);
+        let bins = [
+            (2, 1, Complex32::new(30.0, 10.0)),
+            (1, 3, Complex32::new(-20.0, 25.0)),
+            (5, 2, Complex32::new(15.0, -5.0)),
+            (3, 62, Complex32::new(10.0, 20.0)), // negative ky
+            (60, 4, Complex32::new(-12.0, 8.0)), // negative kx
+        ];
+        let sim = OceanSim::with_h0(&params, h0_with(n, &bins));
+        let scale = 25.0;
+        let field = sim.fields(&[0.7], scale).unwrap().remove(0);
+        let jac = sim.jacobians(&[0.7], scale, n).unwrap().remove(0);
+
+        let dx = params.size / n as f32;
+        let w = |i: isize| i.rem_euclid(n as isize) as usize;
+        let mut max_err = 0.0f32;
+        let mut max_dev = 0.0f32;
+        let mut max_dj = 0.0f32; // largest |det J - 1|, to scale the FD tolerance
+        for i in 0..n as isize {
+            for j in 0..n as isize {
+                let d = |f: &Vec<Vec<f32>>, di: isize, dj: isize| f[w(i + di)][w(j + dj)];
+                let jxx = 1.0 + (d(&field.displacement_x, 1, 0) - d(&field.displacement_x, -1, 0)) / (2.0 * dx);
+                let jyy = 1.0 + (d(&field.displacement_y, 0, 1) - d(&field.displacement_y, 0, -1)) / (2.0 * dx);
+                let jxy = (d(&field.displacement_x, 0, 1) - d(&field.displacement_x, 0, -1)) / (2.0 * dx);
+                let jyx = (d(&field.displacement_y, 1, 0) - d(&field.displacement_y, -1, 0)) / (2.0 * dx);
+                // D is a gradient field, so the Jacobian is symmetric.
+                max_dev = max_dev.max((jxy - jyx).abs());
+                let det_fd = jxx * jyy - jxy * jyx;
+                max_err = max_err.max((det_fd - jac.det[i as usize][j as usize]).abs());
+                max_dj = max_dj.max((jac.det[i as usize][j as usize] - 1.0).abs());
+            }
+        }
+        // Central differences attenuate wave number k by sin(k dx)/(k dx) (0.96 at the highest
+        // mode here), so allow 8% of the signal; a wrong sign or factor would be ~100%.
+        assert!(max_dj > 0.2, "test field too weak: {max_dj}");
+        assert!(max_dev < 0.08 * max_dj, "Dxy != Dyx by {max_dev}");
+        assert!(max_err < 0.08 * max_dj, "spectral vs FD det differ by {max_err} (signal {max_dj})");
+    }
+
+    #[test]
+    fn oversampled_jacobian_matches_coarse_at_coincident_samples() {
+        let params = OceanParams { resolution: 64, size: 20.0, choppiness: 1.5, ..OceanParams::default() };
+        let sim = OceanSim::new(&params).unwrap();
+        let scale = sim.height_scale(&[0.4]).unwrap();
+        let coarse = sim.jacobians(&[0.4], scale, 64).unwrap().remove(0);
+        let fine = sim.jacobians(&[0.4], scale, 128).unwrap().remove(0);
+        assert_eq!(fine.resolution, 128);
+        let mut max_err = 0.0f32;
+        for i in 0..64 {
+            for j in 0..64 {
+                max_err = max_err.max((fine.det[2 * i][2 * j] - coarse.det[i][j]).abs());
+                max_err = max_err.max((fine.lambda_min[2 * i][2 * j] - coarse.lambda_min[i][j]).abs());
+            }
+        }
+        // Not 4x inflated (that would be O(1)): equal up to f32 round-off.
+        assert!(max_err < 1e-4, "{max_err}");
+    }
+
+    #[test]
+    fn oversampling_resolves_finer_structure_than_coarse() {
+        let params = OceanParams { resolution: 32, size: 20.0, choppiness: 2.0, ..OceanParams::default() };
+        let sim = OceanSim::new(&params).unwrap();
+        let scale = sim.height_scale(&[0.0]).unwrap();
+        let coarse = sim.jacobians(&[0.0], scale, 32).unwrap().remove(0);
+        let fine = sim.jacobians(&[0.0], scale, 128).unwrap().remove(0);
+        let min = |j: &JacobianField| j.lambda_min.iter().flatten().cloned().fold(f32::MAX, f32::min);
+        // Between-sample peaks can only make the minimum lower or equal.
+        assert!(min(&fine) <= min(&coarse) + 1e-6);
+    }
+
+    #[test]
+    fn folded_mesh_has_negative_lambda_min() {
+        let params = OceanParams { resolution: 64, size: 20.0, choppiness: 2.5, ..OceanParams::default() };
+        let sim = OceanSim::new(&params).unwrap();
+        let scale = sim.height_scale(&[0.0]).unwrap();
+        let j = sim.jacobians(&[0.0], scale, 64).unwrap().remove(0);
+        let folded = j.det.iter().flatten().filter(|&&d| d < 0.0).count();
+        assert!(folded > 0, "expected folds at high choppiness");
+        for (d, l) in j.det.iter().flatten().zip(j.lambda_min.iter().flatten()) {
+            if *d < 0.0 {
+                assert!(*l < 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn jacobians_reject_bad_input() {
+        let sim = OceanSim::new(&mode_params(0.5)).unwrap();
+        assert!(sim.jacobians(&[], 1.0, 64).is_err());
+        assert!(sim.jacobians(&[0.0], 1.0, 32).is_err()); // below native resolution
+        assert!(sim.jacobians(&[f32::NAN], 1.0, 64).is_err());
+    }
+
+    #[test]
+    fn sim_is_deterministic() {
+        let a = OceanSim::new(&mode_params(1.0)).unwrap().jacobians(&[1.0], 3.0, 64).unwrap();
+        let b = OceanSim::new(&mode_params(1.0)).unwrap().jacobians(&[1.0], 3.0, 64).unwrap();
+        assert_eq!(a[0].lambda_min, b[0].lambda_min);
     }
 }
