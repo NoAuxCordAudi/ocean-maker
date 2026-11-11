@@ -63,3 +63,9 @@ Not investigated: only matters for the deferred in-GLB atlas.
 The sign was flipped (`DISPLACEMENT_SIGN = +1`). `tessendorf::verify_fold_sign` (a test, also
 public) now measures corr(height, div D) < 0 on real output. Mesh geometry changed: choppiness
 now sharpens crests instead of spreading them.
+
+## Phase 3 outcome
+`--foam` writes PNGs + `foam.json` + `ocean_blender.py`. The Blender script was only syntax-checked
+and its manifest verification exercised with plain Python (hash mismatch is rejected); it has
+**not** been run in Blender (not installed). To confirm on first real run: foam image N shows on
+scene frame N (image-user `frame_start = 0`), no V flip, shape keys = frames (+ `Basis`).

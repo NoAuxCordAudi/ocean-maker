@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use ocean_generator::export::{export_glb, morph_data_bytes, Animation};
+use ocean_generator::export::{export_glb, morph_data_bytes, write_foam_sequence, Animation, FoamExport};
+use ocean_generator::foam::{simulate_foam, FoamParams, Trigger};
 use ocean_generator::mesh::{flat_grid, max_seam_error, ocean_mesh, GridSpec, MeshData, SEAM_TOLERANCE};
 use ocean_generator::tessendorf;
 
@@ -78,6 +79,69 @@ struct Args {
     /// Number of tiles in each direction (creates NxN grid)
     #[arg(short = 'g', long, default_value_t = 1)]
     tiles: usize,
+
+    /// Generate whitecap foam: a 16-bit PNG per frame, foam.json and a Blender setup script
+    /// (written to --foam-dir). Needs choppiness > 0 and width == length.
+    #[arg(long)]
+    foam: bool,
+
+    /// Fraction of the surface that triggers foam in each frame (0..1)
+    #[arg(long, default_value_t = 0.02, requires = "foam", conflicts_with = "foam_threshold")]
+    foam_coverage: f32,
+
+    /// Use this Jacobian threshold (lambda_T) instead of calibrating to --foam-coverage
+    #[arg(long, requires = "foam", allow_negative_numbers = true)]
+    foam_threshold: Option<f32>,
+
+    /// Foam edge softness, as a fraction of (1 - lambda_T)
+    #[arg(long, default_value_t = 0.15, requires = "foam")]
+    foam_softness: f32,
+
+    /// Foam e-folding decay time in seconds
+    #[arg(long, default_value_t = 2.0, requires = "foam")]
+    foam_tau: f32,
+
+    /// Foam spin-up before the first frame, in seconds (default: 4.6 x tau)
+    #[arg(long, requires = "foam")]
+    foam_spinup: Option<f32>,
+
+    /// Foam image resolution in texels per side (default: max(256, simulation resolution))
+    #[arg(long, requires = "foam")]
+    foam_resolution: Option<usize>,
+
+    /// Directory for the foam images, manifest and Blender script (default: <output>_foam)
+    #[arg(long, requires = "foam")]
+    foam_dir: Option<PathBuf>,
+
+    /// Do not write ocean_blender.py
+    #[arg(long, requires = "foam")]
+    no_blender_script: bool,
+}
+
+/// Validate foam options up front (before any expensive work) and build the foam parameters.
+fn foam_params(args: &Args, sim_resolution: usize, size: f32) -> Result<FoamParams> {
+    ensure!(
+        args.width == size && args.length == size,
+        "--foam needs width == length: the foam image is mapped onto the mesh UVs, which only \
+         covers one full periodic patch when the mesh is square"
+    );
+    ensure!(args.choppiness > 0.0, "--foam needs --choppiness > 0 (no surface folding otherwise)");
+    let defaults = FoamParams::default();
+    Ok(FoamParams {
+        trigger: match args.foam_threshold {
+            Some(t) => Trigger::Threshold(t),
+            None => Trigger::Coverage(args.foam_coverage),
+        },
+        softness: args.foam_softness,
+        tau: args.foam_tau,
+        spinup: args.foam_spinup,
+        resolution: args.foam_resolution.unwrap_or(defaults.resolution.max(sim_resolution)),
+    })
+}
+
+fn default_foam_dir(output: &Path) -> PathBuf {
+    let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("ocean");
+    output.with_file_name(format!("{stem}_foam"))
 }
 
 fn main() -> Result<()> {
@@ -142,8 +206,14 @@ fn main() -> Result<()> {
         }
     };
 
+    // Validate foam options before doing any expensive work.
+    let foam = args.foam.then(|| foam_params(&args, params.resolution, params.size)).transpose()?;
+
     println!("Computing wave field...");
-    let fields = tessendorf::compute_wave_fields(&params, &times)?;
+    let sim = tessendorf::OceanSim::new(&params)?;
+    let scale = sim.height_scale(&times)?;
+    println!("Height scale: {scale:.6} (peak-to-peak target {:.3})", 2.0 * params.amplitude);
+    let fields = sim.fields(&times, scale)?;
 
     println!("Creating mesh...");
     let meshes: Vec<MeshData> = fields.iter().map(|f| ocean_mesh(&grid, params.size, f)).collect();
@@ -159,6 +229,37 @@ fn main() -> Result<()> {
             export_glb(&rest_pose, Some(animation), &grid, args.tiles, &args.output)?;
         }
         None => export_glb(&meshes[0], None, &grid, args.tiles, &args.output)?,
+    }
+
+    if let Some(fp) = foam {
+        let dt = 1.0 / args.anim_fps;
+        println!("Simulating foam ({} texel resolution, tau {}s)...", fp.resolution, fp.tau);
+        let seq = simulate_foam(&sim, scale, &times, dt, &fp)?;
+        println!(
+            "Foam: threshold {:.3}, {:.2}% of texel-frames trigger, mean foam {:.3}, \
+             {} spin-up frames (residual {:.3})",
+            seq.threshold,
+            seq.trigger_fraction * 100.0,
+            seq.mean_foam,
+            seq.spinup_frames,
+            seq.residual
+        );
+        let dir = args.foam_dir.clone().unwrap_or_else(|| default_foam_dir(&args.output));
+        let shape_keys = if args.anim_duration.is_some() { meshes.len() } else { 0 };
+        let export = FoamExport {
+            sequence: &seq,
+            params: &fp,
+            fps: args.anim_fps,
+            glb_path: &args.output,
+            shape_keys,
+            write_blender_script: !args.no_blender_script,
+        };
+        write_foam_sequence(&dir, &export)
+            .with_context(|| format!("failed to write foam files to {}", dir.display()))?;
+        println!("Foam files written to {}", dir.display());
+        if !args.no_blender_script {
+            println!("In Blender: blender --python {}", dir.join("ocean_blender.py").display());
+        }
     }
 
     println!("Done!");

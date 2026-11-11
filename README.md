@@ -55,6 +55,27 @@ ocean-generator --anim-duration 5 --anim-fps 24 -g 3 -o ocean_anim.glb
   one shared sampler. Tiling adds almost nothing to file size.
 - File size grows as `vertices × frames × 24 bytes`; the CLI prints an estimate first.
 
+## Whitecaps (foam)
+
+```bash
+ocean-generator --anim-duration 4 --anim-fps 24 -c 1.5 -g 3 --foam -o ocean.glb
+blender --python ocean_foam/ocean_blender.py
+```
+
+`--foam` writes next to the GLB, into `<output>_foam/`:
+- `foam_NNNN.png`: 16-bit grayscale foam mask per frame (row 0 = top, no flip needed for the
+  GLB's UVs), `foam.json`: manifest with SHA-256 of every image, `ocean_blender.py`: imports
+  the GLB, builds a water+foam material driven by the image sequence and sets fps/frame range.
+- Foam is the smallest eigenvalue of the Jacobian of the choppy displacement, soft-thresholded,
+  decayed exponentially (`--foam-tau`, default 2 s) and spun up before frame 0. `--foam-coverage`
+  (default 0.02) is the per-frame fraction of the surface that triggers; the threshold is
+  calibrated to it. Foam stays at fixed points, so it trails behind crests.
+- Morph targets cannot carry foam into Blender (its importer reads POSITION deltas only), hence
+  the sidecar images. All tiles show the same foam.
+- Needs `--choppiness > 0` and `width == length`. At default choppiness (0.5) nothing folds, so
+  foam marks the most compressed crests; use `-c 1.5` or more for real breaking.
+- See `docs/whitecaps-proposal.md` and `docs/whitecaps-spikes.md`.
+
 ## Seamless tiling
 
 The FFT field is periodic over `size = max(width, length)`. Vertices sample it with wrap-around
