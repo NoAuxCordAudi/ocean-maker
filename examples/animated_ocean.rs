@@ -1,38 +1,39 @@
-//! Writes a sequence of OBJ frames of an evolving ocean to `./animation_output`.
+//! Writes a 3-second animated ocean as a single GLB using morph targets.
+//! Open `animated_ocean.glb` in Blender (File > Import > glTF) and press play.
 
-mod common;
-
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
-use ocean_generator::tessendorf::{compute_wave_field, OceanParams};
+use ocean_generator::export::{export_glb, Animation};
+use ocean_generator::mesh::{flat_grid, ocean_mesh, GridSpec};
+use ocean_generator::tessendorf::{compute_wave_fields, frame_times, OceanParams};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size = 20.0;
+    let segments = 64;
     let params = OceanParams {
-        resolution: 64,
+        resolution: segments,
         size,
         wind_speed: 5.0,
         amplitude: 0.7,
         choppiness: 0.6,
         ..OceanParams::default()
     };
+    let (start, duration, fps) = (0.0, 3.0, 24.0);
 
-    let frame_count = 60;
-    let time_step = 0.05;
-    let output_dir = PathBuf::from("./animation_output");
-    std::fs::create_dir_all(&output_dir)?;
+    let start_time = Instant::now();
+    let times = frame_times(start, duration, fps)?;
+    println!("Simulating {} frames...", times.len());
+    let fields = compute_wave_fields(&params, &times)?;
 
-    println!("Generating {frame_count} frames...");
-    let start = Instant::now();
-    for frame in 0..frame_count {
-        let field = compute_wave_field(&params, frame as f32 * time_step);
-        let mesh = common::ocean_mesh(&field, size);
-        let path = output_dir.join(format!("ocean_frame_{frame:03}.obj"));
-        common::write_obj(&mesh, &mut BufWriter::new(File::create(&path)?))?;
-    }
-    println!("Done in {:.2?}; frames in {}", start.elapsed(), output_dir.display());
+    let grid = GridSpec::new(size, size, segments, segments)?;
+    let frames: Vec<_> = fields.iter().map(|f| ocean_mesh(&grid, size, f)).collect();
+
+    // The rest pose is a flat grid; every frame becomes a morph target.
+    let rest_pose = flat_grid(&grid);
+    let output = Path::new("animated_ocean.glb");
+    export_glb(&rest_pose, Some(Animation { fps, frames: &frames }), &grid, 1, output)?;
+
+    println!("Wrote {} in {:.2?}", output.display(), start_time.elapsed());
     Ok(())
 }
