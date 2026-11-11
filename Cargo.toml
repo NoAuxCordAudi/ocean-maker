@@ -40,3 +40,6 @@ strip = true
 # Enable static linking for the static profile
 [target.'cfg(target_env = "musl")'.dependencies]
 # Empty block to configure musl target
+
+[dev-dependencies]
+gltf = "1"

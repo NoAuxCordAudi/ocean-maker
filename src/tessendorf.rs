@@ -1,3 +1,4 @@
+use anyhow::{ensure, Result};
 use glam::Vec2;
 use num_complex::Complex32;
 use rand::{Rng, SeedableRng};
@@ -178,137 +179,167 @@ fn dispersion(k: f32, params: &OceanParams) -> f32 {
     base_dispersion
 }
 
-/// Compute wave height field at a given time
-pub fn compute_wave_field(params: &OceanParams, time: f32) -> DisplacementField {
+/// Unscaled spatial-domain fields for one instant.
+struct RawFields {
+    height: Vec<Vec<f32>>,
+    slope_x: Vec<Vec<f32>>,
+    slope_y: Vec<Vec<f32>>,
+    disp_x: Vec<Vec<f32>>,
+    disp_y: Vec<Vec<f32>>,
+}
+
+/// Evolve `h0` to `time` and inverse-transform all fields.
+fn raw_fields(
+    params: &OceanParams,
+    h0: &[Vec<Complex32>],
+    time: f32,
+    planner: &mut FftPlanner<f32>,
+) -> RawFields {
     let n = params.resolution;
-    
-    // Generate initial spectrum h0
-    let h0 = generate_h0(params);
-    
-    // Initialize FFT input fields
-    let mut height_field = vec![vec![Complex32::new(0.0, 0.0); n]; n];
-    let mut slope_x_field = vec![vec![Complex32::new(0.0, 0.0); n]; n];
-    let mut slope_y_field = vec![vec![Complex32::new(0.0, 0.0); n]; n];
-    let mut disp_x_field = vec![vec![Complex32::new(0.0, 0.0); n]; n];
-    let mut disp_y_field = vec![vec![Complex32::new(0.0, 0.0); n]; n];
-    
-    // Compute height field and derivatives for the given time
+    let zero = || vec![vec![Complex32::new(0.0, 0.0); n]; n];
+    let mut height_field = zero();
+    let mut slope_x_field = zero();
+    let mut slope_y_field = zero();
+    let mut disp_x_field = zero();
+    let mut disp_y_field = zero();
+
     for i in 0..n {
         for j in 0..n {
-            // Calculate wave vector k using FFT frequency ordering
             let k_x = 2.0 * PI * fft_freq(i, n) / params.size;
             let k_y = 2.0 * PI * fft_freq(j, n) / params.size;
             let k = Vec2::new(k_x, k_y);
             let k_length = k.length();
-            
-            // Normalize k vector (avoiding division by zero)
-            let k_hat = if k_length > 1e-6 {
-                k / k_length
-            } else {
-                Vec2::new(1.0, 0.0)
-            };
-            
-            // Calculate dispersion
+            let k_hat = if k_length > 1e-6 { k / k_length } else { Vec2::new(1.0, 0.0) };
+
             let omega = dispersion(k_length, params);
-            
-            // Complex exponential for time evolution
             let exp_term = Complex32::new(0.0, omega * time).exp();
             let exp_term_conj = Complex32::new(0.0, -omega * time).exp();
-            
-            // Calculate h_tilde(k, t) and its complex conjugate
+
             let h0_k = h0[i][j];
-            let h0_conj_neg_k = Complex32::new(h0[i][j].re, -h0[i][j].im);
-            
+            let h0_conj_neg_k = Complex32::new(h0_k.re, -h0_k.im);
             let h_tilde = h0_k * exp_term + h0_conj_neg_k * exp_term_conj;
-            
-            // Height field (Eq. 19 in Tessendorf paper)
-            height_field[i][j] = h_tilde;
-            
-            // Slope field (Eq. 20)
-            slope_x_field[i][j] = Complex32::new(0.0, k.x) * h_tilde;
+
+            height_field[i][j] = h_tilde; // Eq. 19
+            slope_x_field[i][j] = Complex32::new(0.0, k.x) * h_tilde; // Eq. 20
             slope_y_field[i][j] = Complex32::new(0.0, k.y) * h_tilde;
-            
-            // Displacement field for choppy waves (Eq. 29)
-            disp_x_field[i][j] = Complex32::new(0.0, -k_hat.x) * h_tilde * params.choppiness;
+            disp_x_field[i][j] = Complex32::new(0.0, -k_hat.x) * h_tilde * params.choppiness; // Eq. 29
             disp_y_field[i][j] = Complex32::new(0.0, -k_hat.y) * h_tilde * params.choppiness;
         }
     }
-    
-    // Prepare FFT
-    let mut planner = FftPlanner::new();
-    
-    // Perform inverse FFT to get spatial representation
-    let mut height = ifft2d(&mut planner, height_field);
-    let slope_x = ifft2d(&mut planner, slope_x_field);
-    let slope_y = ifft2d(&mut planner, slope_y_field);
-    let disp_x = ifft2d(&mut planner, disp_x_field);
-    let disp_y = ifft2d(&mut planner, disp_y_field);
-    
-    // First pass: calculate the current min/max to determine actual range
-    let mut min_height = f32::MAX;
-    let mut max_height = f32::MIN;
-    
-    for i in 0..n {
-        for j in 0..n {
-            min_height = min_height.min(height[i][j]);
-            max_height = max_height.max(height[i][j]);
-        }
+
+    RawFields {
+        height: ifft2d(planner, height_field),
+        slope_x: ifft2d(planner, slope_x_field),
+        slope_y: ifft2d(planner, slope_y_field),
+        disp_x: ifft2d(planner, disp_x_field),
+        disp_y: ifft2d(planner, disp_y_field),
     }
-    
-    // Calculate current range and target range
-    let current_range = max_height - min_height;
-    let target_range = params.amplitude * 2.0; // We want peak-to-peak to be 2*amplitude
-    
-    // Calculate scaling factor to achieve the target range
-    // Avoid division by zero
-    let height_scale_factor = if current_range > 1e-6 {
-        target_range / current_range
-    } else {
-        // If there's no variation, use a reasonable default
-        params.amplitude
-    };
-    
-    println!("Wave height scaling: Raw range = {:.6}, Target = {:.6}, Scale factor = {:.6}", 
-             current_range, target_range, height_scale_factor);
-    
-    // Apply scaling to match the commanded amplitude
-    for i in 0..n {
-        for j in 0..n {
-            // Center around zero and scale to match the target amplitude
-            height[i][j] = (height[i][j] - (min_height + max_height) / 2.0) * height_scale_factor;
-        }
+}
+
+fn height_range(field: &[Vec<f32>]) -> f32 {
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for v in field.iter().flatten() {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
     }
-    
-    // Compute normal vectors from slope
+    hi - lo
+}
+
+fn scale_all(field: &mut [Vec<f32>], scale: f32) {
+    field.iter_mut().flatten().for_each(|v| *v *= scale);
+}
+
+/// Apply one amplitude `scale` to every field (scaling the spectrum is linear, so
+/// height, slope and displacement stay mutually consistent) and derive normals.
+fn finish_field(mut raw: RawFields, scale: f32) -> DisplacementField {
+    let n = raw.height.len();
+    for f in [&mut raw.height, &mut raw.slope_x, &mut raw.slope_y, &mut raw.disp_x, &mut raw.disp_y] {
+        scale_all(f, scale);
+    }
+
     let mut normal_x = vec![vec![0.0; n]; n];
     let mut normal_y = vec![vec![0.0; n]; n];
     let mut normal_z = vec![vec![0.0; n]; n];
-    
     for i in 0..n {
         for j in 0..n {
-            // Create normal from slope (normalized)
-            let nx = -slope_x[i][j];
-            let ny = -slope_y[i][j];
-            let nz = 1.0;
-
-            // Normalize
+            let (nx, ny, nz) = (-raw.slope_x[i][j], -raw.slope_y[i][j], 1.0f32);
             let length = (nx * nx + ny * ny + nz * nz).sqrt();
             normal_x[i][j] = nx / length;
             normal_y[i][j] = ny / length;
             normal_z[i][j] = nz / length;
         }
     }
-    
-    // Create and return the displacement field
+
     DisplacementField {
         resolution: n,
-        height,
-        displacement_x: disp_x,
-        displacement_y: disp_y,
+        height: raw.height,
+        displacement_x: raw.disp_x,
+        displacement_y: raw.disp_y,
         normal_x,
         normal_y,
         normal_z,
     }
+}
+
+/// Keyframe times (seconds of simulation time) for an animation covering
+/// `[start, start + duration]` sampled at `fps`.
+///
+/// Both endpoints are included, so the result has `round(duration * fps) + 1` entries.
+pub fn frame_times(start: f32, duration: f32, fps: f32) -> Result<Vec<f32>> {
+    ensure!(start.is_finite(), "animation start must be finite, got {start}");
+    ensure!(duration.is_finite() && duration > 0.0, "animation duration must be > 0, got {duration}");
+    ensure!(fps.is_finite() && fps > 0.0, "animation fps must be > 0, got {fps}");
+    let intervals = (duration * fps).round() as usize;
+    ensure!(
+        intervals >= 1,
+        "duration {duration}s at {fps} fps yields no full frame interval; increase duration or fps"
+    );
+    Ok((0..=intervals).map(|i| start + i as f32 / fps).collect())
+}
+
+/// Compute displacement fields at several instants of the same ocean.
+///
+/// The spectrum is generated once and one amplitude scale is shared by all frames,
+/// chosen so the *largest* peak-to-peak height over all frames is `2 * amplitude`.
+/// Frames are therefore mutually consistent (heights do not pump between frames).
+///
+/// # Errors
+/// If `times` is empty or non-finite, or `params` has a resolution below 2 or a
+/// non-positive size.
+pub fn compute_wave_fields(params: &OceanParams, times: &[f32]) -> Result<Vec<DisplacementField>> {
+    ensure!(!times.is_empty(), "at least one time is required");
+    ensure!(times.iter().all(|t| t.is_finite()), "times must be finite");
+    ensure!(params.resolution >= 2, "resolution must be at least 2, got {}", params.resolution);
+    ensure!(params.size.is_finite() && params.size > 0.0, "size must be > 0, got {}", params.size);
+
+    let h0 = generate_h0(params);
+    let mut planner = FftPlanner::new();
+    let raws: Vec<RawFields> = times.iter().map(|&t| raw_fields(params, &h0, t, &mut planner)).collect();
+
+    let current_range = raws.iter().map(|r| height_range(&r.height)).fold(0.0f32, f32::max);
+    let target_range = params.amplitude * 2.0; // peak-to-peak should be 2 * amplitude
+    let scale = if current_range > 1e-6 {
+        target_range / current_range
+    } else {
+        // No variation at all; keep the historical fallback.
+        params.amplitude
+    };
+    println!(
+        "Wave height scaling: {} frame(s), raw range = {:.6}, target = {:.6}, scale = {:.6}",
+        raws.len(), current_range, target_range, scale
+    );
+
+    Ok(raws.into_iter().map(|r| finish_field(r, scale)).collect())
+}
+
+/// Compute the wave field at a single time (see [`compute_wave_fields`]).
+///
+/// # Panics
+/// If `params` is invalid (see [`compute_wave_fields`]) or `time` is not finite.
+pub fn compute_wave_field(params: &OceanParams, time: f32) -> DisplacementField {
+    compute_wave_fields(params, &[time])
+        .expect("invalid OceanParams or time")
+        .remove(0)
 }
 
 /// Perform 2D inverse FFT on complex field via row-then-column 1D IFFTs.
@@ -362,6 +393,72 @@ mod tests {
             assert_eq!(f.sample_periodic(k, 0.0), f.sample_periodic(k, n));
             assert_eq!(f.sample_periodic(k, k), f.sample_periodic(k + n, k - n));
         }
+    }
+
+    fn range(f: &DisplacementField) -> f32 {
+        height_range(&f.height)
+    }
+
+    #[test]
+    fn single_frame_hits_commanded_peak_to_peak() {
+        let params = OceanParams { resolution: 32, size: 20.0, amplitude: 1.5, ..OceanParams::default() };
+        let f = compute_wave_field(&params, 0.4);
+        assert!((range(&f) - 3.0).abs() < 1e-3, "range {}", range(&f));
+    }
+
+    #[test]
+    fn sequence_shares_one_scale() {
+        let params = OceanParams { resolution: 32, size: 20.0, amplitude: 1.0, ..OceanParams::default() };
+        let times = frame_times(0.0, 2.0, 10.0).unwrap();
+        let frames = compute_wave_fields(&params, &times).unwrap();
+        let ranges: Vec<f32> = frames.iter().map(range).collect();
+        let max = ranges.iter().cloned().fold(0.0, f32::max);
+        assert!((max - 2.0).abs() < 1e-3, "max range {max}");
+        // Frames are NOT individually normalised.
+        assert!(ranges.iter().any(|r| (r - 2.0).abs() > 1e-3), "{ranges:?}");
+        // A frame inside a sequence equals the same instant in a one-element sequence only
+        // up to the shared scale: ratios of heights between frames must match the raw ratios.
+        let single = compute_wave_fields(&params, &times[3..4]).unwrap().remove(0);
+        let ratio = frames[3].height[2][5] / single.height[2][5];
+        let ratio2 = frames[3].height[7][1] / single.height[7][1];
+        assert!((ratio - ratio2).abs() < 1e-3 * ratio.abs().max(1.0));
+    }
+
+    #[test]
+    fn normals_follow_scaled_slopes() {
+        // Steeper (larger amplitude) ocean must tilt normals more.
+        let mk = |a| {
+            let p = OceanParams { resolution: 32, size: 20.0, amplitude: a, ..OceanParams::default() };
+            compute_wave_field(&p, 0.0)
+        };
+        let tilt = |f: &DisplacementField| f.normal_z.iter().flatten().cloned().fold(1.0f32, f32::min);
+        assert!(tilt(&mk(2.0)) < tilt(&mk(0.2)));
+    }
+
+    #[test]
+    fn frame_times_include_both_endpoints() {
+        let t = frame_times(1.0, 2.0, 4.0).unwrap();
+        assert_eq!(t.len(), 9);
+        assert_eq!(t[0], 1.0);
+        assert_eq!(*t.last().unwrap(), 3.0);
+    }
+
+    #[test]
+    fn frame_times_reject_bad_input() {
+        assert!(frame_times(0.0, 0.0, 24.0).is_err());
+        assert!(frame_times(0.0, -1.0, 24.0).is_err());
+        assert!(frame_times(0.0, 1.0, 0.0).is_err());
+        assert!(frame_times(0.0, 1.0, f32::NAN).is_err());
+        assert!(frame_times(f32::INFINITY, 1.0, 24.0).is_err());
+        assert!(frame_times(0.0, 0.01, 10.0).is_err()); // rounds to zero intervals
+    }
+
+    #[test]
+    fn compute_rejects_bad_params() {
+        let bad = OceanParams { resolution: 1, ..OceanParams::default() };
+        assert!(compute_wave_fields(&bad, &[0.0]).is_err());
+        assert!(compute_wave_fields(&OceanParams::default(), &[]).is_err());
+        assert!(compute_wave_fields(&OceanParams::default(), &[f32::NAN]).is_err());
     }
 
     #[test]
