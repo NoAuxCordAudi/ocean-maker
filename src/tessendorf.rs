@@ -375,6 +375,15 @@ impl OceanSim {
         self.params.choppiness
     }
 
+    /// The evolved spectrum `h~(k, t)` in FFT bin order (`[i][j]`, bin `i` = x, `j` = y), before
+    /// any scaling. Exposed so independent implementations can be checked against this one.
+    pub fn spectrum(&self, time: f32) -> Vec<Vec<Complex32>> {
+        let n = self.params.resolution;
+        (0..n)
+            .map(|i| (0..n).map(|j| spectrum_at(&self.params, &self.h0, i, j, time).2).collect())
+            .collect()
+    }
+
     /// Single height scale such that the largest peak-to-peak height over `times` is
     /// `2 * amplitude`.
     ///

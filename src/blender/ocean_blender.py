@@ -72,6 +72,36 @@ def _first_input(node, names, value):
     raise RuntimeError("none of the inputs %r exist on %s" % (names, node.bl_idname))
 
 
+def _link_noise_breakup(nt, tex, mix):
+    """Foam mask -> (mask + noise detail) -> crisp edge -> mix factor.
+
+    The noise is evaluated in WORLD space so each tile gets different detail even though all
+    tiles share one foam image. Noise only breaks up existing foam (it is multiplied by the
+    mask), so foam never appears where the simulation put none.
+    """
+    geo = nt.nodes.new("ShaderNodeNewGeometry")
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 6.0
+    noise.inputs["Detail"].default_value = 8.0
+    noise.inputs["Roughness"].default_value = 0.6
+    scaled = nt.nodes.new("ShaderNodeMath")  # mask * (0.4 + noise)
+    scaled.operation = "MULTIPLY"
+    offset = nt.nodes.new("ShaderNodeMath")
+    offset.operation = "ADD"
+    offset.inputs[1].default_value = 0.4
+    crisp = nt.nodes.new("ShaderNodeMapRange")
+    crisp.inputs["From Min"].default_value = 0.35
+    crisp.inputs["From Max"].default_value = 0.65
+    crisp.clamp = True
+
+    nt.links.new(geo.outputs["Position"], noise.inputs["Vector"])
+    nt.links.new(noise.outputs["Fac"], offset.inputs[0])
+    nt.links.new(tex.outputs["Color"], scaled.inputs[0])
+    nt.links.new(offset.outputs["Value"], scaled.inputs[1])
+    nt.links.new(scaled.outputs["Value"], crisp.inputs["Value"])
+    nt.links.new(crisp.outputs["Result"], mix.inputs["Fac"])
+
+
 def build_material(bpy, manifest, base):
     n = manifest["frame_count"]
     first = os.path.join(base, manifest["foam_files"][0]["file"])
@@ -113,7 +143,10 @@ def build_material(bpy, manifest, base):
         iu.use_cyclic = False
 
     nt.links.new(uv.outputs["UV"], tex.inputs["Vector"])
-    nt.links.new(tex.outputs["Color"], mix.inputs["Fac"])
+    if manifest.get("noise_breakup", False):
+        _link_noise_breakup(nt, tex, mix)
+    else:
+        nt.links.new(tex.outputs["Color"], mix.inputs["Fac"])
     nt.links.new(water.outputs["BSDF"], mix.inputs[1])
     nt.links.new(foam.outputs["BSDF"], mix.inputs[2])
     nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])

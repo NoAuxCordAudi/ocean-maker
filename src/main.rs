@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use ocean_generator::export::{export_glb, morph_data_bytes, write_foam_sequence, Animation, FoamExport};
-use ocean_generator::foam::{simulate_foam, FoamParams, Trigger};
+use ocean_generator::foam::{mom80, simulate_foam, FoamParams, Trigger};
 use ocean_generator::mesh::{flat_grid, max_seam_error, ocean_mesh, GridSpec, MeshData, SEAM_TOLERANCE};
 use ocean_generator::tessendorf;
 
@@ -85,9 +85,18 @@ struct Args {
     #[arg(long)]
     foam: bool,
 
-    /// Fraction of the surface that triggers foam in each frame (0..1)
-    #[arg(long, default_value_t = 0.02, requires = "foam", conflicts_with = "foam_threshold")]
-    foam_coverage: f32,
+    /// Fraction of the surface that triggers foam in each frame (0..1), or `physical` to use the
+    /// Monahan & O'Muircheartaigh (1980) whitecap fraction for --wind-speed (only ~0.09% at 5 m/s)
+    #[arg(long, default_value = "0.02", requires = "foam", conflicts_with = "foam_threshold")]
+    foam_coverage: CoverageArg,
+
+    /// Foam updates per frame (1-16); raise if the foam looks temporally aliased
+    #[arg(long, default_value_t = 1, requires = "foam")]
+    foam_substeps: usize,
+
+    /// Break the foam mask up with procedural noise in Blender (written to the manifest)
+    #[arg(long, requires = "foam")]
+    foam_noise: bool,
 
     /// Use this Jacobian threshold (lambda_T) instead of calibrating to --foam-coverage
     #[arg(long, requires = "foam", allow_negative_numbers = true)]
@@ -118,6 +127,25 @@ struct Args {
     no_blender_script: bool,
 }
 
+/// `--foam-coverage`: a fraction in (0, 1) or the literal `physical`.
+#[derive(Debug, Clone, Copy)]
+enum CoverageArg {
+    Fraction(f32),
+    Physical,
+}
+
+impl std::str::FromStr for CoverageArg {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        if s == "physical" {
+            return Ok(Self::Physical);
+        }
+        s.parse::<f32>()
+            .map(Self::Fraction)
+            .map_err(|_| format!("expected a fraction like 0.02 or `physical`, got `{s}`"))
+    }
+}
+
 /// Validate foam options up front (before any expensive work) and build the foam parameters.
 fn foam_params(args: &Args, sim_resolution: usize, size: f32) -> Result<FoamParams> {
     ensure!(
@@ -128,10 +156,20 @@ fn foam_params(args: &Args, sim_resolution: usize, size: f32) -> Result<FoamPara
     ensure!(args.choppiness > 0.0, "--foam needs --choppiness > 0 (no surface folding otherwise)");
     let defaults = FoamParams::default();
     Ok(FoamParams {
-        trigger: match args.foam_threshold {
-            Some(t) => Trigger::Threshold(t),
-            None => Trigger::Coverage(args.foam_coverage),
+        trigger: match (args.foam_threshold, args.foam_coverage) {
+            (Some(t), _) => Trigger::Threshold(t),
+            (None, CoverageArg::Fraction(c)) => Trigger::Coverage(c),
+            (None, CoverageArg::Physical) => {
+                let w = mom80(args.wind_speed);
+                println!(
+                    "Physical foam coverage for {} m/s wind: {:.3}% (MOM80; parameterisations vary >10x here)",
+                    args.wind_speed,
+                    w * 100.0
+                );
+                Trigger::Coverage(w)
+            }
         },
+        substeps: args.foam_substeps,
         softness: args.foam_softness,
         tau: args.foam_tau,
         spinup: args.foam_spinup,
@@ -253,6 +291,7 @@ fn main() -> Result<()> {
             glb_path: &args.output,
             shape_keys,
             write_blender_script: !args.no_blender_script,
+            noise_breakup: args.foam_noise,
         };
         write_foam_sequence(&dir, &export)
             .with_context(|| format!("failed to write foam files to {}", dir.display()))?;

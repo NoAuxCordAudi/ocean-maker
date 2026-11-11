@@ -147,6 +147,8 @@ pub struct FoamExport<'a> {
     /// Number of shape keys (morph targets) the GLB has; 0 for a still.
     pub shape_keys: usize,
     pub write_blender_script: bool,
+    /// Ask the Blender script to break the mask up with procedural noise.
+    pub noise_breakup: bool,
 }
 
 /// Encode a foam mask as a 16-bit grayscale PNG. `mask` is row-major, `resolution`² values in
@@ -215,6 +217,7 @@ pub fn write_foam_sequence(dir: &Path, e: &FoamExport<'_>) -> Result<()> {
         "fps": e.fps,
         "frame_count": seq.frames.len(),
         "shape_keys": e.shape_keys,
+        "noise_breakup": e.noise_breakup,
         "resolution": seq.resolution,
         "image": "16-bit grayscale PNG, row 0 = top (glTF v ~ 0), texel centres at (i + 0.5) / resolution; non-colour data, repeat",
         "foam": {
@@ -446,7 +449,7 @@ mod tests {
         let foam_dir = dir.join("ocean_foam");
         let e = FoamExport {
             sequence: &seq, params: &params, fps: 4.0, glb_path: &glb,
-            shape_keys: fx.frames.len(), write_blender_script: true,
+            shape_keys: fx.frames.len(), write_blender_script: true, noise_breakup: false,
         };
         write_foam_sequence(&foam_dir, &e).unwrap();
 
@@ -455,6 +458,7 @@ mod tests {
         assert_eq!(manifest["glb"], "../ocean.glb");
         assert_eq!(manifest["frame_count"], fx.frames.len());
         assert_eq!(manifest["shape_keys"], fx.frames.len());
+        assert_eq!(manifest["noise_breakup"], false);
         let files = manifest["foam_files"].as_array().unwrap();
         assert_eq!(files.len(), fx.frames.len());
         for f in files {
@@ -480,7 +484,7 @@ mod tests {
         let seq = sequence(vec![vec![0.5; 16]], 4);
         let params = FoamParams::default();
         fn mk<'a>(seq: &'a FoamSequence, params: &'a FoamParams, fps: f32, glb: &'a Path, script: bool) -> FoamExport<'a> {
-            FoamExport { sequence: seq, params, fps, glb_path: glb, shape_keys: 0, write_blender_script: script }
+            FoamExport { sequence: seq, params, fps, glb_path: glb, shape_keys: 0, write_blender_script: script, noise_breakup: true }
         }
         write_foam_sequence(&dir, &mk(&seq, &params, 24.0, &glb, false)).unwrap();
         assert!(!dir.join("ocean_blender.py").exists());

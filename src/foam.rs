@@ -39,11 +39,14 @@ pub struct FoamParams {
     pub spinup: Option<f32>,
     /// Foam texture resolution (texels per side); at least the simulation resolution.
     pub resolution: usize,
+    /// Foam updates per output frame (1 = one per frame). Raise it when crests move several
+    /// texels between frames and the trigger is temporally aliased; cost and memory scale with it.
+    pub substeps: usize,
 }
 
 impl Default for FoamParams {
     fn default() -> Self {
-        Self { trigger: Trigger::Coverage(0.02), softness: 0.15, tau: 2.0, spinup: None, resolution: 256 }
+        Self { trigger: Trigger::Coverage(0.02), softness: 0.15, tau: 2.0, spinup: None, resolution: 256, substeps: 1 }
     }
 }
 
@@ -57,7 +60,7 @@ pub struct FoamSequence {
     pub spinup_frames: usize,
     /// Upper bound of the weight of the un-simulated past at frame 0 (`alpha^spinup_frames`).
     pub residual: f32,
-    /// Fraction of simulated texel-frames with `lambda_min < threshold`.
+    /// Fraction of simulated texel-updates with `lambda_min < threshold`.
     pub trigger_fraction: f32,
     /// Mean foam value over the clip frames.
     pub mean_foam: f32,
@@ -128,10 +131,15 @@ pub fn simulate_foam(
         params.resolution,
         sim.resolution()
     );
+    ensure!((1..=16).contains(&params.substeps), "foam substeps must be in 1..=16, got {}", params.substeps);
     ensure!(sim.choppiness() > 0.0, "foam needs choppiness > 0 (no surface folding otherwise)");
 
-    let alpha = (-dt / params.tau).exp();
-    let auto_frames = ((0.01f32).ln() / alpha.ln()).ceil() as usize;
+    let k = params.substeps;
+    let sub_dt = dt / k as f32;
+    // Per-update decay factor; the spin-up length is defined in whole output frames.
+    let alpha = (-sub_dt / params.tau).exp();
+    let alpha_frame = (-dt / params.tau).exp();
+    let auto_frames = ((0.01f32).ln() / alpha_frame.ln()).ceil() as usize;
     let spinup_frames = match params.spinup {
         None => auto_frames,
         Some(s) => {
@@ -139,7 +147,7 @@ pub fn simulate_foam(
             (s / dt).ceil() as usize
         }
     };
-    let residual = alpha.powi(spinup_frames as i32);
+    let residual = alpha_frame.powi(spinup_frames as i32);
 
     // Spin-up frames precede the clip at the same spacing; they are simulated and dropped.
     let start = clip_times[0];
@@ -148,10 +156,16 @@ pub fn simulate_foam(
         .chain(clip_times.iter().copied())
         .collect();
 
-    // lambda_min for every frame, row-major (x fastest), sampled at texel centres.
+    // Each output frame is preceded by `k - 1` intermediate updates at `dt / k` spacing.
+    let update_times: Vec<f32> = all_times
+        .iter()
+        .flat_map(|&t| (0..k).map(move |s| t - dt * (k - 1 - s) as f32 / k as f32))
+        .collect();
+
+    // lambda_min for every update, row-major (x fastest), sampled at texel centres.
     let m = params.resolution;
-    let mut lambdas: Vec<Vec<f32>> = Vec::with_capacity(all_times.len());
-    for chunk in all_times.chunks(16) {
+    let mut lambdas: Vec<Vec<f32>> = Vec::with_capacity(update_times.len());
+    for chunk in update_times.chunks(16) {
         for j in sim.jacobians(chunk, scale, m, 0.5)? {
             let mut flat = Vec::with_capacity(m * m);
             for row in 0..m {
@@ -187,7 +201,7 @@ pub fn simulate_foam(
         for (f, &l) in foam.iter_mut().zip(lambda) {
             *f = step(*f, trigger_value(l, threshold, params.softness), alpha);
         }
-        if n >= spinup_frames {
+        if n / k >= spinup_frames && n % k == k - 1 {
             frames.push(foam.clone());
         }
     }
@@ -214,6 +228,7 @@ pub fn simulate_foam(
 mod tests {
     use super::*;
     use crate::tessendorf::{frame_times, OceanParams};
+
 
     fn params(c: f32) -> OceanParams {
         OceanParams { resolution: 32, size: 20.0, choppiness: c, amplitude: 1.0, ..OceanParams::default() }
@@ -359,6 +374,22 @@ mod tests {
         let sim = OceanSim::new(&params(1.0)).unwrap();
         assert!(simulate_foam(&sim, 1.0, &[], 0.1, &ok).is_err());
         assert!(simulate_foam(&sim, 1.0, &[0.0], 0.0, &ok).is_err());
+    }
+
+    #[test]
+    fn substeps_only_add_triggers_and_keep_frame_count() {
+        let base = FoamParams { trigger: Trigger::Threshold(0.8), ..small() };
+        let one = run(1.2, &base, 4).unwrap();
+        let four = run(1.2, &FoamParams { substeps: 4, ..base }, 4).unwrap();
+        assert_eq!(one.frames.len(), four.frames.len());
+        // Same decay per frame, more trigger samples in between: pointwise >= (up to f32 noise).
+        for (a, b) in one.frames.iter().flatten().zip(four.frames.iter().flatten()) {
+            assert!(b + 1e-4 >= *a, "{b} < {a}");
+        }
+        assert!(four.mean_foam > one.mean_foam);
+        assert!((four.residual - one.residual).abs() < 1e-6);
+        assert!(run(1.2, &FoamParams { substeps: 0, ..base }, 2).is_err());
+        assert!(run(1.2, &FoamParams { substeps: 17, ..base }, 2).is_err());
     }
 
     #[test]

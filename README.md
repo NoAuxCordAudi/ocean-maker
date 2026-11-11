@@ -72,6 +72,10 @@ blender --python ocean_foam/ocean_blender.py
   calibrated to it. Foam stays at fixed points, so it trails behind crests.
 - Morph targets cannot carry foam into Blender (its importer reads POSITION deltas only), hence
   the sidecar images. All tiles show the same foam.
+- `--foam-coverage physical` uses the Monahan & O'Muircheartaigh (1980) whitecap fraction for
+  `--wind-speed` (only ~0.09% at 5 m/s, ~4% at 15 m/s; sources disagree by >10x at low wind).
+  `--foam-substeps N` updates foam N times per frame if the trigger looks temporally aliased.
+  `--foam-noise` makes the Blender material break the mask up with world-space noise.
 - Needs `--choppiness > 0` and `width == length`. At default choppiness (0.5) nothing folds, so
   foam marks the most compressed crests; use `-c 1.5` or more for real breaking.
 - See `docs/whitecaps-proposal.md` and `docs/whitecaps-spikes.md`.
@@ -98,6 +102,11 @@ export_glb(&mesh, None, &grid, 3, "ocean.glb".as_ref())?;
 
 For animation use `frame_times` + `compute_wave_fields`, then pass `Animation { fps, frames }`
 with a `flat_grid` rest pose to `export_glb`. See `examples/`.
+
+## Verification
+
+`cargo test` covers the unit/property tests. `tests/ref/run.sh` additionally compares the
+Jacobian with an independent numpy implementation (agreement ~1e-7 on a strongly folding field).
 
 ## Python animation script
 

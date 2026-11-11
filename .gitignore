@@ -4,3 +4,4 @@
 *stl
 Cargo.lock
 *.gif
+tests/ref/.venv

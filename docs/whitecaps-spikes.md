@@ -69,3 +69,22 @@ now sharpens crests instead of spreading them.
 and its manifest verification exercised with plain Python (hash mismatch is rejected); it has
 **not** been run in Blender (not installed). To confirm on first real run: foam image N shows on
 scene frame N (image-user `frame_start = 0`), no V flip, shape keys = frames (+ `Basis`).
+
+## Phase 4 outcome
+Done:
+- `--foam-coverage physical` (MOM80), `--foam-substeps`, `--foam-noise` (world-space noise
+  breakup in the Blender material; written to the manifest, **untested in Blender**).
+- Independent reference: `tests/ref/run.sh` recomputes height, displacement, Jacobian and
+  `lambda_min` with numpy using a different algorithm; agreement ~1e-7 on a field with
+  `max|J-1| = 1.6` (strong folding).
+
+Not done, with reasons:
+- **Blender Ocean modifier structural comparison** — needs Blender (not installed).
+- **2-IFFT packing** (two real fields per complex IFFT) — not applicable: the crate's spectrum
+  `h~ = h0 e^{iwt} + conj(h0) e^{-iwt}` is not Hermitian in k, so the fields are real parts of
+  complex transforms, not real signals.
+- **Wind sweep as a monotonicity test** — not valid: heights are renormalised to the commanded
+  amplitude, so higher wind gives longer waves and *less* relative displacement (see table in
+  section 2, 20 m patch). Foam coverage is therefore set by calibration, not by wind.
+- **In-GLB foam atlas** (KHR_animation_pointer) — deferred, as proposed.
+- Bump/roughness-from-foam look-dev — left to the artist in Blender.
