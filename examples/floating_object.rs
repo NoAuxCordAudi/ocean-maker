@@ -1,134 +1,67 @@
-use std::f32::consts::PI;
+//! Places a box-shaped "boat" on the ocean surface, tilted to the local normal.
+//! Writes `ocean.obj` and `boat.obj` to `./floating_output`.
+
+mod common;
+
 use std::fs::File;
+use std::io::BufWriter;
 use std::path::PathBuf;
 
-use ocean_generator::prelude::*;
-use ocean_generator::wave;
+use glam::{Quat, Vec3};
+use ocean_generator::tessendorf::{compute_wave_field, OceanParams};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Generating ocean with floating object...");
-    
-    // Create ocean mesh
-    let mut ocean = Mesh::new_plane(
-        30.0,       // width
-        30.0,       // length
-        60,         // width segments
-        60,         // length segments
-        0.0,        // no random noise
-    );
-    
-    // Create simple boat mesh (just a rectangular prism)
-    let boat = create_boat_mesh(3.0, 1.5, 0.8);
-    
-    // Generate wave parameters for the ocean
-    let wave_params = wave::generate_wave_params(
-        4,          // 4 wave components
-        0.5,        // amplitude
-        6.0,        // wavelength
-        0.4,        // steepness
-        30.0,       // direction (degrees)
-        123,        // random seed
-    );
-    
-    // Apply wave simulation to the ocean at time=0
-    ocean.apply_waves(&wave_params, 0.0);
-    
-    // Sample points on the ocean surface to determine boat position and orientation
-    let time = 0.0;
-    let boat_center_x = 5.0;
-    let boat_center_z = 2.0;
-    
-    // Create output directory
-    let output_dir = PathBuf::from("./floating_output");
-    std::fs::create_dir_all(&output_dir)?;
-    
-    // Export ocean
-    let ocean_path = output_dir.join("ocean.obj");
-    let mut ocean_file = File::create(&ocean_path)?;
-    export_mesh(&ocean, ExportFormat::Obj, &mut ocean_file)?;
-    
-    // Export boat positioned on the ocean
-    let boat_path = output_dir.join("boat.obj");
-    let mut boat_file = File::create(&boat_path)?;
-    export_mesh(&boat, ExportFormat::Obj, &mut boat_file)?;
-    
-    println!("Ocean and floating object exported to: {}", output_dir.display());
-    
-    Ok(())
+/// Axis-aligned box centred at the origin, with outward-facing triangles.
+fn box_mesh(half: Vec3) -> common::Mesh {
+    let mut positions = Vec::new();
+    for &z in &[-half.z, half.z] {
+        for &(x, y) in &[(-half.x, -half.y), (half.x, -half.y), (half.x, half.y), (-half.x, half.y)] {
+            positions.push(Vec3::new(x, y, z));
+        }
+    }
+    let triangles = vec![
+        [0, 2, 1], [0, 3, 2], // bottom
+        [4, 5, 6], [4, 6, 7], // top
+        [0, 1, 5], [0, 5, 4], // -y
+        [1, 2, 6], [1, 6, 5], // +x
+        [2, 3, 7], [2, 7, 6], // +y
+        [3, 0, 4], [3, 4, 7], // -x
+    ];
+    let normals = positions.iter().map(|p| p.normalize()).collect();
+    common::Mesh { positions, normals, triangles }
 }
 
-fn create_boat_mesh(length: f32, width: f32, height: f32) -> Mesh {
-    let mut vertices = Vec::new();
-    let mut faces = Vec::new();
-    
-    // Create a simple boat shape (rectangular prism)
-    let half_length = length / 2.0;
-    let half_width = width / 2.0;
-    
-    // Bottom vertices
-    vertices.push(Vertex {
-        position: glam::Vec3::new(-half_length, 0.0, -half_width),
-        normal: glam::Vec3::new(0.0, -1.0, 0.0),
-        uv: glam::Vec2::new(0.0, 0.0),
-    });
-    vertices.push(Vertex {
-        position: glam::Vec3::new(half_length, 0.0, -half_width),
-        normal: glam::Vec3::new(0.0, -1.0, 0.0),
-        uv: glam::Vec2::new(1.0, 0.0),
-    });
-    vertices.push(Vertex {
-        position: glam::Vec3::new(half_length, 0.0, half_width),
-        normal: glam::Vec3::new(0.0, -1.0, 0.0),
-        uv: glam::Vec2::new(1.0, 1.0),
-    });
-    vertices.push(Vertex {
-        position: glam::Vec3::new(-half_length, 0.0, half_width),
-        normal: glam::Vec3::new(0.0, -1.0, 0.0),
-        uv: glam::Vec2::new(0.0, 1.0),
-    });
-    
-    // Top vertices
-    vertices.push(Vertex {
-        position: glam::Vec3::new(-half_length, height, -half_width),
-        normal: glam::Vec3::new(0.0, 1.0, 0.0),
-        uv: glam::Vec2::new(0.0, 0.0),
-    });
-    vertices.push(Vertex {
-        position: glam::Vec3::new(half_length, height, -half_width),
-        normal: glam::Vec3::new(0.0, 1.0, 0.0),
-        uv: glam::Vec2::new(1.0, 0.0),
-    });
-    vertices.push(Vertex {
-        position: glam::Vec3::new(half_length, height, half_width),
-        normal: glam::Vec3::new(0.0, 1.0, 0.0),
-        uv: glam::Vec2::new(1.0, 1.0),
-    });
-    vertices.push(Vertex {
-        position: glam::Vec3::new(-half_length, height, half_width),
-        normal: glam::Vec3::new(0.0, 1.0, 0.0),
-        uv: glam::Vec2::new(0.0, 1.0),
-    });
-    
-    // Bottom face
-    faces.push(Face(0, 2, 1));
-    faces.push(Face(0, 3, 2));
-    
-    // Top face
-    faces.push(Face(4, 5, 6));
-    faces.push(Face(4, 6, 7));
-    
-    // Side faces
-    faces.push(Face(0, 1, 5));
-    faces.push(Face(0, 5, 4));
-    
-    faces.push(Face(1, 2, 6));
-    faces.push(Face(1, 6, 5));
-    
-    faces.push(Face(2, 3, 7));
-    faces.push(Face(2, 7, 6));
-    
-    faces.push(Face(3, 0, 4));
-    faces.push(Face(3, 4, 7));
-    
-    Mesh { vertices, faces }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let size = 30.0;
+    let params = OceanParams {
+        resolution: 64,
+        size,
+        wind_speed: 6.0,
+        amplitude: 0.5,
+        wind_direction: glam::Vec2::new(30f32.to_radians().cos(), 30f32.to_radians().sin()),
+        seed: 123,
+        ..OceanParams::default()
+    };
+    let field = compute_wave_field(&params, 0.0);
+    let ocean = common::ocean_mesh(&field, size);
+
+    // Sit the boat on the surface at (5, 2), rotated so its up axis follows the surface normal.
+    let (bx, by) = (5.0, 2.0);
+    let (surface_z, normal) = common::height_at(&field, size, bx, by);
+    let rotation = Quat::from_rotation_arc(Vec3::Z, normal);
+    let half = Vec3::new(1.5, 0.75, 0.4);
+    let mut boat = box_mesh(half);
+    let center = Vec3::new(bx, by, surface_z) + normal * half.z;
+    for p in &mut boat.positions {
+        *p = rotation * *p + center;
+    }
+    for n in &mut boat.normals {
+        *n = rotation * *n;
+    }
+
+    let output_dir = PathBuf::from("./floating_output");
+    std::fs::create_dir_all(&output_dir)?;
+    common::write_obj(&ocean, &mut BufWriter::new(File::create(output_dir.join("ocean.obj"))?))?;
+    common::write_obj(&boat, &mut BufWriter::new(File::create(output_dir.join("boat.obj"))?))?;
+    println!("Wrote ocean.obj and boat.obj to {}", output_dir.display());
+    Ok(())
 }
