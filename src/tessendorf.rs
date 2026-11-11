@@ -365,6 +365,16 @@ impl OceanSim {
         Self { params: params.clone(), h0 }
     }
 
+    /// Simulation grid resolution.
+    pub fn resolution(&self) -> usize {
+        self.params.resolution
+    }
+
+    /// Choppiness factor.
+    pub fn choppiness(&self) -> f32 {
+        self.params.choppiness
+    }
+
     /// Single height scale such that the largest peak-to-peak height over `times` is
     /// `2 * amplitude`.
     ///
@@ -408,18 +418,29 @@ impl OceanSim {
     /// is zero-padded, which band-limit interpolates the *linear* fields; the nonlinear
     /// eigenvalue is then evaluated on the finer grid. Values at coincident grid points equal the
     /// coarse values (the unnormalised sum is unchanged, so no `(M/N)^2` factor is needed).
-    /// Output texel `(i, j)` lies at `x = i / out_resolution * size`.
+    /// Output texel `(i, j)` lies at `x = (i + sample_offset) / out_resolution * size`; use
+    /// `sample_offset = 0.5` for texel *centres* (image textures), `0.0` for grid points. The
+    /// shift is applied exactly in the spectrum.
     ///
     /// The Nyquist row/column is dropped (its derivative is ill-defined).
     ///
     /// # Errors
     /// If `times` is empty/non-finite or `out_resolution < resolution`.
-    pub fn jacobians(&self, times: &[f32], scale: f32, out_resolution: usize) -> Result<Vec<JacobianField>> {
+    pub fn jacobians(
+        &self,
+        times: &[f32],
+        scale: f32,
+        out_resolution: usize,
+        sample_offset: f32,
+    ) -> Result<Vec<JacobianField>> {
         ensure_finite_times(times)?;
+        ensure!(sample_offset.is_finite(), "sample_offset must be finite");
         let n = self.params.resolution;
         ensure!(out_resolution >= n, "out_resolution {out_resolution} must be >= resolution {n}");
         let mut planner = FftPlanner::new();
         let c = self.params.choppiness * scale;
+        // Spatial shift of `delta` world units = multiply bin k by e^{+i k . delta}.
+        let delta = sample_offset * self.params.size / out_resolution as f32;
         let is_nyquist = |idx: usize| n.is_multiple_of(2) && idx == n / 2;
 
         Ok(times
@@ -438,6 +459,7 @@ impl OceanSim {
                             continue;
                         }
                         let m = -DISPLACEMENT_SIGN * c / kl;
+                        let h = h * Complex32::new(0.0, (k.x + k.y) * delta).exp();
                         xx[i][j] = h * (m * k.x * k.x);
                         yy[i][j] = h * (m * k.y * k.y);
                         xy[i][j] = h * (m * k.x * k.y);
@@ -723,7 +745,7 @@ mod tests {
         let k = 2.0 * PI * 3.0 / params.size;
 
         let field = sim.fields(&[0.0], 1.0).unwrap().remove(0);
-        let jac = sim.jacobians(&[0.0], 1.0, n).unwrap().remove(0);
+        let jac = sim.jacobians(&[0.0], 1.0, n, 0.0).unwrap().remove(0);
         for i in 0..n {
             let x = i as f32 / n as f32 * params.size;
             let theta = k * x;
@@ -742,7 +764,7 @@ mod tests {
     fn zero_choppiness_gives_identity_jacobian() {
         let params = mode_params(0.0);
         let sim = OceanSim::new(&params).unwrap();
-        let j = sim.jacobians(&[0.3], 5.0, 64).unwrap().remove(0);
+        let j = sim.jacobians(&[0.3], 5.0, 64, 0.0).unwrap().remove(0);
         assert!(j.lambda_min.iter().flatten().all(|&v| v == 1.0));
         assert!(j.det.iter().flatten().all(|&v| v == 1.0));
     }
@@ -761,7 +783,7 @@ mod tests {
         let sim = OceanSim::with_h0(&params, h0_with(n, &bins));
         let scale = 25.0;
         let field = sim.fields(&[0.7], scale).unwrap().remove(0);
-        let jac = sim.jacobians(&[0.7], scale, n).unwrap().remove(0);
+        let jac = sim.jacobians(&[0.7], scale, n, 0.0).unwrap().remove(0);
 
         let dx = params.size / n as f32;
         let w = |i: isize| i.rem_euclid(n as isize) as usize;
@@ -794,8 +816,8 @@ mod tests {
         let params = OceanParams { resolution: 64, size: 20.0, choppiness: 1.5, ..OceanParams::default() };
         let sim = OceanSim::new(&params).unwrap();
         let scale = sim.height_scale(&[0.4]).unwrap();
-        let coarse = sim.jacobians(&[0.4], scale, 64).unwrap().remove(0);
-        let fine = sim.jacobians(&[0.4], scale, 128).unwrap().remove(0);
+        let coarse = sim.jacobians(&[0.4], scale, 64, 0.0).unwrap().remove(0);
+        let fine = sim.jacobians(&[0.4], scale, 128, 0.0).unwrap().remove(0);
         assert_eq!(fine.resolution, 128);
         let mut max_err = 0.0f32;
         for i in 0..64 {
@@ -813,8 +835,8 @@ mod tests {
         let params = OceanParams { resolution: 32, size: 20.0, choppiness: 2.0, ..OceanParams::default() };
         let sim = OceanSim::new(&params).unwrap();
         let scale = sim.height_scale(&[0.0]).unwrap();
-        let coarse = sim.jacobians(&[0.0], scale, 32).unwrap().remove(0);
-        let fine = sim.jacobians(&[0.0], scale, 128).unwrap().remove(0);
+        let coarse = sim.jacobians(&[0.0], scale, 32, 0.0).unwrap().remove(0);
+        let fine = sim.jacobians(&[0.0], scale, 128, 0.0).unwrap().remove(0);
         let min = |j: &JacobianField| j.lambda_min.iter().flatten().cloned().fold(f32::MAX, f32::min);
         // Between-sample peaks can only make the minimum lower or equal.
         assert!(min(&fine) <= min(&coarse) + 1e-6);
@@ -825,7 +847,7 @@ mod tests {
         let params = OceanParams { resolution: 64, size: 20.0, choppiness: 2.5, ..OceanParams::default() };
         let sim = OceanSim::new(&params).unwrap();
         let scale = sim.height_scale(&[0.0]).unwrap();
-        let j = sim.jacobians(&[0.0], scale, 64).unwrap().remove(0);
+        let j = sim.jacobians(&[0.0], scale, 64, 0.0).unwrap().remove(0);
         let folded = j.det.iter().flatten().filter(|&&d| d < 0.0).count();
         assert!(folded > 0, "expected folds at high choppiness");
         for (d, l) in j.det.iter().flatten().zip(j.lambda_min.iter().flatten()) {
@@ -836,17 +858,37 @@ mod tests {
     }
 
     #[test]
+    fn sample_offset_shifts_texel_centres() {
+        let params = OceanParams { resolution: 64, size: 20.0, choppiness: 1.5, ..OceanParams::default() };
+        let sim = OceanSim::new(&params).unwrap();
+        let scale = sim.height_scale(&[0.4]).unwrap();
+        // Half-texel-offset 128 grid == odd samples of the plain 256 grid.
+        let shifted = sim.jacobians(&[0.4], scale, 128, 0.5).unwrap().remove(0);
+        let fine = sim.jacobians(&[0.4], scale, 256, 0.0).unwrap().remove(0);
+        let mut max_err = 0.0f32;
+        for i in 0..128 {
+            for j in 0..128 {
+                max_err = max_err.max((shifted.det[i][j] - fine.det[2 * i + 1][2 * j + 1]).abs());
+            }
+        }
+        assert!(max_err < 1e-4, "{max_err}");
+        // and it is genuinely different from the unshifted grid
+        let plain = sim.jacobians(&[0.4], scale, 128, 0.0).unwrap().remove(0);
+        assert!(plain.det != shifted.det);
+    }
+
+    #[test]
     fn jacobians_reject_bad_input() {
         let sim = OceanSim::new(&mode_params(0.5)).unwrap();
-        assert!(sim.jacobians(&[], 1.0, 64).is_err());
-        assert!(sim.jacobians(&[0.0], 1.0, 32).is_err()); // below native resolution
-        assert!(sim.jacobians(&[f32::NAN], 1.0, 64).is_err());
+        assert!(sim.jacobians(&[], 1.0, 64, 0.0).is_err());
+        assert!(sim.jacobians(&[0.0], 1.0, 32, 0.0).is_err()); // below native resolution
+        assert!(sim.jacobians(&[f32::NAN], 1.0, 64, 0.0).is_err());
     }
 
     #[test]
     fn sim_is_deterministic() {
-        let a = OceanSim::new(&mode_params(1.0)).unwrap().jacobians(&[1.0], 3.0, 64).unwrap();
-        let b = OceanSim::new(&mode_params(1.0)).unwrap().jacobians(&[1.0], 3.0, 64).unwrap();
+        let a = OceanSim::new(&mode_params(1.0)).unwrap().jacobians(&[1.0], 3.0, 64, 0.0).unwrap();
+        let b = OceanSim::new(&mode_params(1.0)).unwrap().jacobians(&[1.0], 3.0, 64, 0.0).unwrap();
         assert_eq!(a[0].lambda_min, b[0].lambda_min);
     }
 }
